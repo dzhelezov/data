@@ -184,6 +184,12 @@ pub fn build_metrics_registry() -> Registry {
         QUERY_ERROR_TOO_MANY_DATA_WAITERS.clone()
     );
 
+    registry.register(
+        "ingest_source_errors",
+        "Upstream data source ingestion errors, by source host and kind (connect/timeout/http/io/...)",
+        sqd_data_source::metrics::INGEST_SOURCE_ERRORS.clone()
+    );
+
     registry.register("http_status", "Number of sent HTTP responses", HTTP_STATUS.clone());
     registry.register(
         "http_seconds_to_first_byte",

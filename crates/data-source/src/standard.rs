@@ -221,6 +221,8 @@ impl<C: DataClient> Endpoint<C> {
     }
 
     fn on_error(&mut self, error: anyhow::Error) {
+        crate::metrics::record_ingest_source_error(&self.client.source_label(), self.client.error_kind(&error));
+
         let backoff = [0, 100, 200, 500, 1000, 2000, 5000, 10000];
         let pause = backoff[std::cmp::min(self.error_counter, backoff.len() - 1)];
         if pause > 0 {

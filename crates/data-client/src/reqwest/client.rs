@@ -226,6 +226,39 @@ impl DataClient for ReqwestDataClient {
     fn is_retryable(&self, err: &anyhow::Error) -> bool {
         self.is_retryable(err)
     }
+
+    fn error_kind(&self, err: &anyhow::Error) -> &'static str {
+        for cause in err.chain() {
+            if cause.downcast_ref::<UnexpectedHttpStatus>().is_some() {
+                return "http";
+            }
+            if let Some(reqwest_error) = cause.downcast_ref::<reqwest::Error>() {
+                if reqwest_error.is_timeout() {
+                    return "timeout";
+                }
+                if reqwest_error.is_connect() {
+                    return "connect";
+                }
+                if reqwest_error.is_status() {
+                    return "http";
+                }
+                if reqwest_error.is_body() || reqwest_error.is_decode() {
+                    return "decode";
+                }
+                if reqwest_error.is_request() {
+                    return "request";
+                }
+            }
+            if cause.downcast_ref::<std::io::Error>().is_some() {
+                return "io";
+            }
+        }
+        "other"
+    }
+
+    fn source_label(&self) -> String {
+        self.url.host_str().unwrap_or("unknown").to_string()
+    }
 }
 
 #[derive(Debug)]
