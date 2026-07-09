@@ -11,14 +11,28 @@ use sqd_storage::{
 };
 use tempfile::TempDir;
 
-fn open_db(kind: &str) -> (TempDir, Database, DatasetId) {
+fn open_db_with(kind: &str, block_hash_index: bool) -> (TempDir, Database, DatasetId) {
     // The TempDir guard is returned and kept alive for the whole test so the
     // on-disk database isn't removed out from under RocksDB.
     let db_dir = tempfile::tempdir().unwrap();
-    let db = DatabaseSettings::default().open(db_dir.path()).unwrap();
+    let db = reopen(&db_dir, block_hash_index);
     let dataset_id = DatasetId::from_str("test-dataset");
     db.create_dataset(dataset_id, DatasetKind::from_str(kind)).unwrap();
     (db_dir, db, dataset_id)
+}
+
+/// Opens the database at `dir` again, e.g. to simulate a restart with a
+/// different `block_hash_index` setting. Any previous `Database` over the same
+/// directory must be dropped first - RocksDB holds an exclusive lock on it.
+fn reopen(dir: &TempDir, block_hash_index: bool) -> Database {
+    DatabaseSettings::default()
+        .with_block_hash_index(block_hash_index)
+        .open(dir.path())
+        .unwrap()
+}
+
+fn open_db(kind: &str) -> (TempDir, Database, DatasetId) {
+    open_db_with(kind, true)
 }
 
 fn setup_evm_db() -> (TempDir, Database, DatasetId) {
@@ -242,6 +256,82 @@ fn non_evm_dataset_is_not_indexed() {
 
     let chunk = make_evm_chunk(&db, 0, 9, "base");
     db.insert_chunk(dataset_id, &chunk).unwrap();
+
+    for n in 0..=9 {
+        assert_absent(&db, dataset_id, &block_hash(n));
+    }
+}
+
+#[test]
+fn index_disabled_writes_nothing() {
+    // An EVM dataset still isn't indexed while the flag is off.
+    let (_dir, db, dataset_id) = open_db_with("evm", false);
+
+    let chunk = make_evm_chunk(&db, 0, 9, "base");
+    db.insert_chunk(dataset_id, &chunk).unwrap();
+
+    for n in 0..=9 {
+        assert_absent(&db, dataset_id, &block_hash(n));
+    }
+
+    // Pruning a never-indexed chunk short-circuits on the prefix probe.
+    db.update_dataset(dataset_id, |tx| tx.delete_chunk(&chunk)).unwrap();
+}
+
+#[test]
+fn index_entries_drain_after_flag_is_turned_off() {
+    // Guards the asymmetric gating: `index_block_hashes` honours the flag,
+    // `unindex_block_hashes` does not. Entries written while the flag was on must
+    // still be reclaimed by retention once it goes off, or they would be stranded.
+    let (dir, db, dataset_id) = setup_evm_db();
+
+    let chunk1 = make_evm_chunk(&db, 0, 9, "base");
+    let chunk2 = make_evm_chunk(&db, 10, 19, &block_hash(9));
+    db.insert_chunk(dataset_id, &chunk1).unwrap();
+    db.insert_chunk(dataset_id, &chunk2).unwrap();
+    drop(db);
+
+    // Restart with indexing disabled.
+    let db = reopen(&dir, false);
+
+    // New chunks are no longer indexed...
+    let chunk3 = make_evm_chunk(&db, 20, 29, &block_hash(19));
+    db.insert_chunk(dataset_id, &chunk3).unwrap();
+    for n in 20..=29 {
+        assert_absent(&db, dataset_id, &block_hash(n));
+    }
+
+    // ...but pruning still reclaims what the previous run wrote.
+    db.update_dataset(dataset_id, |tx| tx.delete_chunk(&chunk1)).unwrap();
+    for n in 0..=9 {
+        assert_absent(&db, dataset_id, &block_hash(n));
+    }
+    for n in 10..=19 {
+        assert_resolves(&db, dataset_id, n);
+    }
+
+    // Down to the last entry, after which the probe short-circuits.
+    db.update_dataset(dataset_id, |tx| tx.delete_chunk(&chunk2)).unwrap();
+    for n in 10..=19 {
+        assert_absent(&db, dataset_id, &block_hash(n));
+    }
+    db.update_dataset(dataset_id, |tx| tx.delete_chunk(&chunk3)).unwrap();
+}
+
+#[test]
+fn probe_sees_pending_writes_within_the_same_transaction() {
+    // Verifies the claim in `has_block_hash_entries`: iterating the transaction
+    // merges its own uncommitted puts, so a chunk indexed and pruned inside one
+    // `update_dataset` closure leaves nothing behind, even though the dataset had
+    // zero committed entries when the probe ran.
+    let (_dir, db, dataset_id) = setup_evm_db();
+
+    let chunk = make_evm_chunk(&db, 0, 9, "base");
+    db.update_dataset(dataset_id, |tx| {
+        tx.insert_chunk(&chunk)?;
+        tx.delete_chunk(&chunk)
+    })
+    .unwrap();
 
     for n in 0..=9 {
         assert_absent(&db, dataset_id, &block_hash(n));

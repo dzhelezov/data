@@ -53,6 +53,16 @@ pub struct CLI {
     #[arg(long)]
     pub rocksdb_disable_direct_io: bool,
 
+    /// Index block hashes of newly ingested chunks, enabling
+    /// `GET /datasets/{id}/hashes/{hash}/block`. EVM datasets only.
+    ///
+    /// There is no backfill: hashes from chunks ingested before this was turned
+    /// on stay unresolvable until those chunks roll off via retention. Turning it
+    /// back off stops new writes and lets existing entries drain as chunks are
+    /// pruned; the lookup endpoint then reports 404 for anything already gone.
+    #[arg(long)]
+    pub block_hash_index: bool,
+
     /// Known client IDs for metrics labeling. Client IDs not in this list
     /// will be reported as "unknown" to prevent metrics cardinality abuse.
     #[arg(long = "known-client", value_name = "ID")]
@@ -76,6 +86,7 @@ impl CLI {
             .with_data_cache_size(self.data_cache_size)
             .with_rocksdb_stats(self.rocksdb_stats)
             .with_direct_io(!self.rocksdb_disable_direct_io)
+            .with_block_hash_index(self.block_hash_index)
             .open(&self.database_dir)
             .map(Arc::new)
             .context("failed to open rocksdb database")?;

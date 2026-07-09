@@ -7,13 +7,13 @@ use sqd_primitives::Name;
 
 use super::{
     data::{BlockHashIndexKey, Dataset, DatasetId, DatasetKind, DatasetLabel},
-    read::snapshot::ReadSnapshot,
+    read::snapshot::ReadSnapshot
 };
 use crate::db::{
     ops::{perform_dataset_compaction, CompactionStatus},
     read::datasets::list_all_datasets,
     write::{ops::deleted_deleted_tables, table_builder::TableBuilder, tx::Tx},
-    Chunk, DatasetUpdate,
+    Chunk, DatasetUpdate
 };
 
 pub(super) const CF_DATASETS: Name = "DATASETS";
@@ -36,6 +36,7 @@ pub struct DatabaseSettings {
     with_rocksdb_stats: bool,
     direct_io: bool,
     cache_index_and_filter_blocks: bool,
+    block_hash_index: bool
 }
 
 impl Default for DatabaseSettings {
@@ -46,6 +47,7 @@ impl Default for DatabaseSettings {
             with_rocksdb_stats: false,
             direct_io: false,
             cache_index_and_filter_blocks: false,
+            block_hash_index: false
         }
     }
 }
@@ -73,6 +75,17 @@ impl DatabaseSettings {
 
     pub fn with_cache_index_and_filter_blocks(mut self, yes: bool) -> Self {
         self.cache_index_and_filter_blocks = yes;
+        self
+    }
+
+    /// Whether newly ingested chunks get their block hashes written to the
+    /// `hash -> block number` index (see `Tx::index_block_hashes`).
+    ///
+    /// Off by default. Turning it on affects writes only: index entries are
+    /// always removed when their chunk is pruned, so a dataset indexed under a
+    /// previous run drains cleanly once this is switched back off.
+    pub fn with_block_hash_index(mut self, yes: bool) -> Self {
+        self.block_hash_index = yes;
         self
     }
 
@@ -146,17 +159,22 @@ impl DatabaseSettings {
                 ColumnFamilyDescriptor::new(CF_TABLES, self.tables_cf_options()),
                 ColumnFamilyDescriptor::new(CF_DIRTY_TABLES, self.cf_default_options()),
                 ColumnFamilyDescriptor::new(CF_DELETED_TABLES, self.cf_default_options()),
-                ColumnFamilyDescriptor::new(CF_BLOCK_HASHES, self.cf_default_options()),
-            ],
+                ColumnFamilyDescriptor::new(CF_BLOCK_HASHES, self.cf_default_options())
+            ]
         )?;
 
-        Ok(Database { db, options })
+        Ok(Database {
+            db,
+            options,
+            block_hash_index: self.block_hash_index
+        })
     }
 }
 
 pub struct Database {
     db: RocksDB,
     options: RocksOptions,
+    block_hash_index: bool
 }
 
 impl Database {
@@ -169,8 +187,8 @@ impl Database {
                 &DatasetLabel::V0 {
                     kind,
                     version: 0,
-                    finalized_head: None,
-                },
+                    finalized_head: None
+                }
             )
         })
     }
@@ -192,8 +210,8 @@ impl Database {
                     &DatasetLabel::V0 {
                         kind,
                         version: 0,
-                        finalized_head: None,
-                    },
+                        finalized_head: None
+                    }
                 )
             }
         })
@@ -213,14 +231,16 @@ impl Database {
 
     pub fn update_dataset<F, R>(&self, dataset_id: DatasetId, mut cb: F) -> anyhow::Result<R>
     where
-        F: FnMut(&mut DatasetUpdate<'_>) -> anyhow::Result<R>,
+        F: FnMut(&mut DatasetUpdate<'_>) -> anyhow::Result<R>
     {
-        Tx::new(&self.db).run(|tx| {
-            let mut upd = DatasetUpdate::new(tx, dataset_id)?;
-            let result = cb(&mut upd)?;
-            upd.finish()?;
-            Ok(result)
-        })
+        Tx::new(&self.db)
+            .with_block_hash_index(self.block_hash_index)
+            .run(|tx| {
+                let mut upd = DatasetUpdate::new(tx, dataset_id)?;
+                let result = cb(&mut upd)?;
+                upd.finish()?;
+                Ok(result)
+            })
     }
 
     pub fn snapshot(&self) -> ReadSnapshot<'_> {
@@ -237,14 +257,14 @@ impl Database {
         dataset_id: DatasetId,
         max_chunk_size: Option<usize>,
         write_amplification_limit: Option<f64>,
-        compaction_len_limit: Option<usize>,
+        compaction_len_limit: Option<usize>
     ) -> anyhow::Result<CompactionStatus> {
         perform_dataset_compaction(
             &self.db,
             dataset_id,
             max_chunk_size,
             write_amplification_limit,
-            compaction_len_limit,
+            compaction_len_limit
         )
     }
 

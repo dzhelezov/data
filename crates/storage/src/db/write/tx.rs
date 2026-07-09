@@ -52,7 +52,8 @@ fn is_indexed_kind(kind: DatasetKind) -> bool {
 
 pub struct Tx<'a> {
     db: &'a RocksDB,
-    transaction: RocksTransaction<'a>
+    transaction: RocksTransaction<'a>,
+    block_hash_index: bool
 }
 
 impl<'a> Tx<'a> {
@@ -62,7 +63,22 @@ impl<'a> Tx<'a> {
 
         let transaction = db.transaction_opt(&rocksdb::WriteOptions::default(), &tx_options);
 
-        Self { db, transaction }
+        Self {
+            db,
+            transaction,
+            block_hash_index: false
+        }
+    }
+
+    /// Enables `hash -> block number` indexing for chunks written through this
+    /// transaction. Off by default, which suits every `Tx` that never ingests a
+    /// chunk (dataset creation, deletion, compaction); [`Database::update_dataset`]
+    /// turns it on from [`DatabaseSettings::with_block_hash_index`].
+    ///
+    /// Write-side only - see [`Tx::unindex_block_hashes`].
+    pub fn with_block_hash_index(mut self, yes: bool) -> Self {
+        self.block_hash_index = yes;
+        self
     }
 
     pub fn run<R, F>(self, mut cb: F) -> anyhow::Result<R>
@@ -70,6 +86,7 @@ impl<'a> Tx<'a> {
         F: FnMut(&Self) -> anyhow::Result<R>
     {
         let db = self.db;
+        let block_hash_index = self.block_hash_index;
         let mut tx = self;
         loop {
             let result = cb(&tx)?;
@@ -77,7 +94,7 @@ impl<'a> Tx<'a> {
                 Ok(_) => return Ok(result),
                 Err(err) if err.kind() == rocksdb::ErrorKind::TryAgain || err.kind() == rocksdb::ErrorKind::Busy => {
                     record_restart();
-                    tx = Self::new(db)
+                    tx = Self::new(db).with_block_hash_index(block_hash_index)
                 }
                 Err(err) => return Err(err.into())
             }
@@ -147,12 +164,17 @@ impl<'a> Tx<'a> {
     /// `CF_BLOCK_HASHES`. Called one level above `write_chunk` (which stays a
     /// pure metadata op) whenever a chunk enters a dataset: ingest and fork.
     ///
-    /// No-op unless the dataset kind is whitelisted in [`is_indexed_kind`].
+    /// No-op unless indexing is enabled on this transaction *and* the dataset
+    /// kind is whitelisted in [`is_indexed_kind`].
     /// Reads the table through a fresh `ReadSnapshot` (the same pattern as
     /// `validate_parent_block_hash`): tables are immutable once `finish()`ed, so
     /// this is safe, while the index writes go through `self.transaction` and are
     /// thus atomic with the chunk metadata.
     pub fn index_block_hashes(&self, dataset_id: DatasetId, chunk: &Chunk) -> anyhow::Result<()> {
+        if !self.block_hash_index {
+            return Ok(());
+        }
+
         let Some(label) = self.find_label_for_update(dataset_id)? else {
             return Ok(()); // dataset does not exist - nothing to index
         };
@@ -178,14 +200,21 @@ impl<'a> Tx<'a> {
     /// from `CF_BLOCK_HASHES`. Called one level above `delete_chunk` whenever a
     /// chunk leaves a dataset: fork overwrite, retention, dataset deletion.
     ///
+    /// Deliberately gated on neither `self.block_hash_index` nor the dataset
+    /// kind, unlike [`Tx::index_block_hashes`]. Entries written while the flag
+    /// was on must still be removed once their chunk is pruned - otherwise
+    /// turning the flag off would strand them, resolving hashes to blocks that
+    /// no longer exist and growing without bound. Gating on "does this dataset
+    /// have any entries at all" instead lets an indexed dataset drain as
+    /// retention rolls its chunks off, and keeps the never-indexed case (flag
+    /// off, or a non-EVM kind) down to a single seek.
+    ///
     /// Idempotent: `delete_cf` on a missing key is a no-op in RocksDB, so it is
-    /// safe over chunks that were never indexed (e.g. pre-upgrade chunks, or
-    /// non-EVM datasets which short-circuit on the kind check).
+    /// safe over chunks that were never indexed - e.g. pre-upgrade chunks, or
+    /// chunks ingested while the flag was off in a dataset that still holds
+    /// entries from when it was on.
     pub fn unindex_block_hashes(&self, dataset_id: DatasetId, chunk: &Chunk) -> anyhow::Result<()> {
-        let Some(label) = self.find_label_for_update(dataset_id)? else {
-            return Ok(());
-        };
-        if !is_indexed_kind(label.kind()) {
+        if !self.has_block_hash_entries(dataset_id)? {
             return Ok(());
         }
 
@@ -201,6 +230,29 @@ impl<'a> Tx<'a> {
                 .delete_cf(cf, BlockHashIndexKey::new(dataset_id, hash))?;
             Ok(())
         })
+    }
+
+    /// Whether `dataset_id` holds at least one `CF_BLOCK_HASHES` entry.
+    ///
+    /// A single seek to the dataset's key prefix, bounded above by the end of
+    /// that prefix - no `blocks` table is read. Iterating the transaction (rather
+    /// than the bare DB) merges its pending writes and tombstones, so the answer
+    /// stays accurate part-way through a multi-chunk `insert_fork`.
+    fn has_block_hash_entries(&self, dataset_id: DatasetId) -> anyhow::Result<bool> {
+        let (start, end) = BlockHashIndexKey::dataset_range(dataset_id);
+
+        let mut read_opts = rocksdb::ReadOptions::default();
+        read_opts.set_snapshot(&self.transaction.snapshot());
+        read_opts.set_iterate_upper_bound(end);
+
+        let mut cursor = self
+            .transaction
+            .raw_iterator_cf_opt(self.cf_handle(CF_BLOCK_HASHES), read_opts);
+
+        cursor.seek(&start);
+        cursor.status()?;
+
+        Ok(cursor.valid())
     }
 
     pub fn insert_fork(&self, dataset_id: DatasetId, chunk: &Chunk) -> anyhow::Result<()> {
