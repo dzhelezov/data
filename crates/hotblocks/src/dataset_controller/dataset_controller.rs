@@ -108,9 +108,7 @@ impl DatasetController {
     }
 
     /// Resolves a block hash to its `BlockRef` via the storage index.
-    ///
-    /// A point lookup against RocksDB, run on the blocking pool (same pattern as
-    /// `Ctl::new_write_ctx`). `Ok(None)` means the hash is not in the index.
+    /// `Ok(None)` means the hash is not in the index.
     pub async fn get_block_by_hash(&self, hash: String) -> anyhow::Result<Option<BlockRef>> {
         let db = self.db.clone();
         let dataset_id = self.dataset_id;

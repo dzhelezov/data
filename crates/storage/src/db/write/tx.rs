@@ -41,11 +41,9 @@ fn record_restart() {
     LOCAL_RESTARTS.with_borrow_mut(|val| *val = val.wrapping_add(1))
 }
 
-/// Whether a dataset of the given kind gets its block hashes indexed in
-/// `CF_BLOCK_HASHES`. Currently EVM-only; extend this whitelist (e.g. Bitcoin,
-/// Tron) when those chains need hash lookups. Hyperliquid is intentionally
-/// excluded - its `hash` is an arbitrary string, not a crypto hash, so it can
-/// collide and silently overwrite index entries.
+/// Datasets whose block hashes get indexed in `CF_BLOCK_HASHES`. EVM-only for
+/// now; hyperliquid must stay out - its `hash` is not a crypto hash and can
+/// collide.
 fn is_indexed_kind(kind: DatasetKind) -> bool {
     kind == DatasetKind::from_str("evm")
 }
@@ -70,12 +68,8 @@ impl<'a> Tx<'a> {
         }
     }
 
-    /// Enables `hash -> block number` indexing for chunks written through this
-    /// transaction. Off by default, which suits every `Tx` that never ingests a
-    /// chunk (dataset creation, deletion, compaction); [`Database::update_dataset`]
-    /// turns it on from [`DatabaseSettings::with_block_hash_index`].
-    ///
-    /// Write-side only - see [`Tx::unindex_block_hashes`].
+    /// Enables block hash indexing for chunks written through this transaction.
+    /// Set by [`Database::update_dataset`] from the database-level setting.
     pub fn with_block_hash_index(mut self, yes: bool) -> Self {
         self.block_hash_index = yes;
         self
@@ -160,16 +154,9 @@ impl<'a> Tx<'a> {
         Ok(())
     }
 
-    /// Adds every `(hash -> block_number)` pair of `chunk`'s `blocks` table to
-    /// `CF_BLOCK_HASHES`. Called one level above `write_chunk` (which stays a
-    /// pure metadata op) whenever a chunk enters a dataset: ingest and fork.
-    ///
-    /// No-op unless indexing is enabled on this transaction *and* the dataset
-    /// kind is whitelisted in [`is_indexed_kind`].
-    /// Reads the table through a fresh `ReadSnapshot` (the same pattern as
-    /// `validate_parent_block_hash`): tables are immutable once `finish()`ed, so
-    /// this is safe, while the index writes go through `self.transaction` and are
-    /// thus atomic with the chunk metadata.
+    /// Adds every `(hash, block number)` pair of `chunk`'s `blocks` table to
+    /// `CF_BLOCK_HASHES`. No-op unless indexing is enabled on this transaction
+    /// and the dataset kind is whitelisted in [`is_indexed_kind`].
     pub fn index_block_hashes(&self, dataset_id: DatasetId, chunk: &Chunk) -> anyhow::Result<()> {
         if !self.block_hash_index {
             return Ok(());
@@ -196,23 +183,13 @@ impl<'a> Tx<'a> {
         })
     }
 
-    /// Removes every `(hash -> block_number)` pair of `chunk`'s `blocks` table
-    /// from `CF_BLOCK_HASHES`. Called one level above `delete_chunk` whenever a
-    /// chunk leaves a dataset: fork overwrite, retention, dataset deletion.
+    /// Removes every hash of `chunk`'s `blocks` table from `CF_BLOCK_HASHES`.
     ///
-    /// Deliberately gated on neither `self.block_hash_index` nor the dataset
-    /// kind, unlike [`Tx::index_block_hashes`]. Entries written while the flag
-    /// was on must still be removed once their chunk is pruned - otherwise
-    /// turning the flag off would strand them, resolving hashes to blocks that
-    /// no longer exist and growing without bound. Gating on "does this dataset
-    /// have any entries at all" instead lets an indexed dataset drain as
-    /// retention rolls its chunks off, and keeps the never-indexed case (flag
-    /// off, or a non-EVM kind) down to a single seek.
-    ///
-    /// Idempotent: `delete_cf` on a missing key is a no-op in RocksDB, so it is
-    /// safe over chunks that were never indexed - e.g. pre-upgrade chunks, or
-    /// chunks ingested while the flag was off in a dataset that still holds
-    /// entries from when it was on.
+    /// Unlike [`Tx::index_block_hashes`], gated on neither the flag nor the
+    /// dataset kind, but on whether the dataset has any entries at all -
+    /// entries written while the flag was on must still be removed when their
+    /// chunk is pruned, or they would be stranded forever. Idempotent over
+    /// never-indexed chunks: `delete_cf` on a missing key is a no-op.
     pub fn unindex_block_hashes(&self, dataset_id: DatasetId, chunk: &Chunk) -> anyhow::Result<()> {
         if !self.has_block_hash_entries(dataset_id)? {
             return Ok(());
@@ -232,12 +209,9 @@ impl<'a> Tx<'a> {
         })
     }
 
-    /// Whether `dataset_id` holds at least one `CF_BLOCK_HASHES` entry.
-    ///
-    /// A single seek to the dataset's key prefix, bounded above by the end of
-    /// that prefix - no `blocks` table is read. Iterating the transaction (rather
-    /// than the bare DB) merges its pending writes and tombstones, so the answer
-    /// stays accurate part-way through a multi-chunk `insert_fork`.
+    /// Whether `dataset_id` holds at least one `CF_BLOCK_HASHES` entry: a
+    /// single seek. Iterating the transaction (not the bare DB) keeps the
+    /// answer accurate part-way through a multi-chunk `insert_fork`.
     fn has_block_hash_entries(&self, dataset_id: DatasetId) -> anyhow::Result<bool> {
         let (start, end) = BlockHashIndexKey::dataset_range(dataset_id);
 

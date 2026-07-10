@@ -55,15 +55,10 @@ fn find_block_row<BN: Copy + Ord>(numbers: &[BN], block: BN) -> Option<usize> {
         .map(|e| e.0)
 }
 
-/// Streams all `(block_number, hash)` pairs of a `blocks` table.
-///
-/// The `number` and `hash` columns are read in batches of [`BLOCK_HASH_BATCH_SIZE`]
-/// rows so that peak memory stays `O(batch)` rather than `O(num_blocks)` even for
-/// large compacted chunks. `visit` is called once per row.
-///
-/// Schema contract (mirrors [`get_parent_block_hash`]): `number` must be `UInt32`
-/// or `UInt64` and `hash` must be `Utf8`; anything else is a hard error so that a
-/// future schema change surfaces loudly instead of indexing garbage.
+/// Streams all `(block number, hash)` pairs of a `blocks` table, reading the
+/// columns in batches so peak memory stays `O(batch)` even for large compacted
+/// chunks. `number` must be `UInt32`/`UInt64` and `hash` must be `Utf8`;
+/// anything else is a hard error rather than silently indexed garbage.
 pub fn for_each_block_hash<S: KvRead + Sync>(
     blocks_table: &TableReader<S>,
     mut visit: impl FnMut(BlockNumber, &str) -> anyhow::Result<()>

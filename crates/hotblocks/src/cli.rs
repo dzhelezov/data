@@ -56,10 +56,8 @@ pub struct CLI {
     /// Index block hashes of newly ingested chunks, enabling
     /// `GET /datasets/{id}/hashes/{hash}/block`. EVM datasets only.
     ///
-    /// There is no backfill: hashes from chunks ingested before this was turned
-    /// on stay unresolvable until those chunks roll off via retention. Turning it
-    /// back off stops new writes and lets existing entries drain as chunks are
-    /// pruned; the lookup endpoint then reports 404 for anything already gone.
+    /// No backfill: pre-existing chunks stay unresolvable until they roll off
+    /// via retention. Entries drain as chunks are pruned after switching off.
     #[arg(long)]
     pub block_hash_index: bool,
 

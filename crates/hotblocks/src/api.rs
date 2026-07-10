@@ -368,14 +368,7 @@ async fn get_block_by_hash(
     Extension(client_id): Extension<ClientId>,
     Path((dataset_id, hash)): Path<(DatasetId, String)>
 ) -> impl IntoResponse {
-    // `get_dataset!` returns from the enclosing fn, which doesn't work inside the
-    // synchronous `with_response` closure, and the lookup must be `.await`ed
-    // first - so existence/validation happen up front and the awaited result is
-    // handed to `with_response`.
-
-    // Reject obviously-invalid lengths before touching the DB. Crypto hashes are
-    // ~64-66 chars (hex, EVM/Bitcoin/Tron) up to ~88 (base58, Solana); 256 is a
-    // generous ceiling that still cuts off megabyte-sized URLs.
+    // Reject absurd lengths before touching the DB (real hashes are 64-88 chars).
     if hash.is_empty() || hash.len() > 256 {
         return ResponseWithMetadata::new()
             .with_client_id(&client_id)
@@ -399,7 +392,6 @@ async fn get_block_by_hash(
         Ok(Some(block_ref)) => json_ok!(block_ref),
         Ok(None) => text!(StatusCode::NOT_FOUND, "block not found"),
         Err(err) => {
-            // Terse body; the full chain (and any backtrace from `{:?}`) goes to the log.
             error!(error = ?err, dataset_id = %dataset_id, "get_block_by_hash failed");
             text!(StatusCode::INTERNAL_SERVER_ERROR, "internal error")
         }

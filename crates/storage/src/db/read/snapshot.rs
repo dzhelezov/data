@@ -75,10 +75,8 @@ impl<'a> ReadSnapshot<'a> {
         self.list_chunks(dataset_id, 0, None).into_reversed().next().transpose()
     }
 
-    /// Resolves a block hash to its `BlockRef` via the `CF_BLOCK_HASHES` index.
-    ///
-    /// `Ok(None)` means the hash is not indexed (unknown, or from a chunk that
-    /// predates the index / a non-indexed dataset kind).
+    /// Resolves a block hash via the `CF_BLOCK_HASHES` index. `Ok(None)` means
+    /// the hash is not indexed (unknown, pre-index chunk, or non-indexed kind).
     pub fn find_block_by_hash(&self, dataset_id: DatasetId, hash: &str) -> anyhow::Result<Option<BlockRef>> {
         let key = BlockHashIndexKey::new(dataset_id, hash);
         let Some(bytes) = self
@@ -87,9 +85,7 @@ impl<'a> ReadSnapshot<'a> {
         else {
             return Ok(None);
         };
-        // Defensive on the storage boundary: a wrong length means corruption
-        // (bit rot, a write-path bug, a downgrade). Returning an error keeps the
-        // process alive (HTTP 500) instead of panicking into a crash loop.
+        // A wrong length means corruption; error rather than panic.
         let arr: [u8; 8] = bytes
             .as_ref()
             .try_into()

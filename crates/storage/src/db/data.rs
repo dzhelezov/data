@@ -99,11 +99,9 @@ impl Display for ChunkId {
     }
 }
 
-/// Key for the `hash -> block number` index stored in `CF_BLOCK_HASHES`.
-///
-/// Layout: `dataset_id (48 bytes) || hash UTF-8 bytes`. The hash is stored
-/// exactly as it appears in the Arrow `hash` column (no normalization), so the
-/// encoding stays chain-agnostic.
+/// Key for the `hash -> block number` index in `CF_BLOCK_HASHES`:
+/// `dataset_id (48 bytes) || hash UTF-8 bytes`, the hash exactly as it appears
+/// in the Arrow `hash` column (no normalization).
 pub(crate) struct BlockHashIndexKey {
     bytes: Vec<u8>
 }
@@ -116,10 +114,7 @@ impl BlockHashIndexKey {
         Self { bytes }
     }
 
-    /// The `[start, end)` key range covering every entry of `dataset_id`. Lets a
-    /// whole dataset's index be dropped with a single `delete_range_cf` instead
-    /// of one `delete_cf` per block. Relies on the `dataset_id` being a
-    /// fixed-length (48-byte) prefix, so no other dataset's keys fall inside.
+    /// The `[start, end)` key range covering every entry of `dataset_id`.
     pub fn dataset_range(dataset_id: DatasetId) -> (Vec<u8>, Vec<u8>) {
         let start = dataset_id.as_ref().to_vec();
         let end = prefix_upper_bound(&start);
@@ -133,11 +128,9 @@ impl AsRef<[u8]> for BlockHashIndexKey {
     }
 }
 
-/// Smallest byte string strictly greater than every key beginning with
-/// `prefix` - the exclusive upper bound of the prefix's key range. Increments
-/// the last non-`0xFF` byte, dropping trailing `0xFF`s. A 48-byte `DatasetId`
-/// is ASCII/zero-padded, never all-`0xFF`, so this always yields a non-empty
-/// bound in practice.
+/// Exclusive upper bound of `prefix`'s key range: increments the last
+/// non-`0xFF` byte. A `DatasetId` is never all-`0xFF`, so the bound is
+/// always non-empty.
 fn prefix_upper_bound(prefix: &[u8]) -> Vec<u8> {
     let mut end = prefix.to_vec();
     while let Some(last) = end.last_mut() {

@@ -78,12 +78,9 @@ impl DatabaseSettings {
         self
     }
 
-    /// Whether newly ingested chunks get their block hashes written to the
-    /// `hash -> block number` index (see `Tx::index_block_hashes`).
-    ///
-    /// Off by default. Turning it on affects writes only: index entries are
-    /// always removed when their chunk is pruned, so a dataset indexed under a
-    /// previous run drains cleanly once this is switched back off.
+    /// Whether newly ingested chunks get their block hashes indexed in
+    /// `CF_BLOCK_HASHES`. Write-side only: entries are always removed when
+    /// their chunk is pruned, so the index drains after the flag goes off.
     pub fn with_block_hash_index(mut self, yes: bool) -> Self {
         self.block_hash_index = yes;
         self
@@ -269,17 +266,10 @@ impl Database {
     }
 
     pub fn delete_dataset(&self, dataset_id: DatasetId) -> anyhow::Result<()> {
-        // Drop the whole index for this dataset with one range tombstone over
-        // its `dataset_id` prefix. Kept out of the transaction below because
-        // `delete_range` isn't allowed inside a RocksDB tx; a crash in between
-        // leaves chunks without index entries (hashes 404 until re-indexed),
-        // not corruption, and the next startup retries.
-        let (start, end) = BlockHashIndexKey::dataset_range(dataset_id);
-        self.db
-            .delete_range_cf(self.db.cf_handle(CF_BLOCK_HASHES).unwrap(), start, end)?;
+        self.purge_block_hash_index(dataset_id)?;
 
         // Metadata is removed atomically in one transaction, so the dataset is
-        // never observed half-deleted. `find_label_for_update` takes the lock.
+        // never observed half-deleted.
         Tx::new(&self.db).run(|tx| {
             if tx.find_label_for_update(dataset_id)?.is_none() {
                 return Ok(());
@@ -292,6 +282,38 @@ impl Database {
         })?;
 
         self.cleanup()?;
+        Ok(())
+    }
+
+    /// Point-deletes every `CF_BLOCK_HASHES` entry of `dataset_id` in bounded
+    /// batches (`delete_range` is not supported on `OptimisticTransactionDB`).
+    /// Runs outside the metadata transaction: a crash in between leaves chunks
+    /// without index entries (hashes 404), not corruption.
+    fn purge_block_hash_index(&self, dataset_id: DatasetId) -> anyhow::Result<()> {
+        const BATCH_SIZE: usize = 10_000;
+
+        let cf = self.db.cf_handle(CF_BLOCK_HASHES).unwrap();
+        let (start, end) = BlockHashIndexKey::dataset_range(dataset_id);
+
+        let mut read_opts = rocksdb::ReadOptions::default();
+        read_opts.set_iterate_upper_bound(end);
+
+        let mut cursor = self.db.raw_iterator_cf_opt(cf, read_opts);
+        cursor.seek(&start);
+
+        let mut batch = RocksWriteBatch::default();
+        while cursor.valid() {
+            batch.delete_cf(cf, cursor.key().unwrap());
+            if batch.len() >= BATCH_SIZE {
+                self.db.write(std::mem::take(&mut batch))?;
+            }
+            cursor.next();
+        }
+        cursor.status()?;
+
+        if !batch.is_empty() {
+            self.db.write(batch)?;
+        }
         Ok(())
     }
 
