@@ -466,7 +466,7 @@ impl Ctl {
                 blocking_write!(write, write.retain(number, parent_hash))?;
                 match state {
                     State::Ingest { .. } if !will_erase_head => {} // Keep ingesting, head is valid
-                    _ => *state = State::Init { head: None }       // New ingest needed
+                    _ => *state = State::Init { head: None },      // New ingest needed
                 }
             }
             RetentionStrategy::Head(n) => match state {
@@ -620,7 +620,7 @@ async fn compaction_loop(db: DBRef, dataset_id: DatasetId, mut enabled: tokio::s
                         size = merged_chunks.iter().map(|c| c.size).sum::<usize>(),
                         max_merged_size = merged_chunks.iter().map(|c| c.size).max().unwrap(),
                         "merged {} chunks",
-                        merged_chunks.len(),
+                        merged_chunks.len()
                     );
                     skips = 0;
                 }

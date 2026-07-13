@@ -67,7 +67,7 @@ impl QuerySlot {
     pub async fn run<R, F>(self, task: F) -> R
     where
         F: FnOnce(&Self) -> R + Send + 'static,
-        R: Send + 'static
+        R: Send + 'static,
     {
         let (tx, rx) = tokio::sync::oneshot::channel();
 

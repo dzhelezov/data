@@ -107,7 +107,7 @@ pub struct IngestGeneric<DC, CB> {
 impl<DS, CB> IngestGeneric<DS, CB>
 where
     DS: DataSource,
-    CB: BlockChunkBuilder<Block = DS::Block> + Send + 'static
+    CB: BlockChunkBuilder<Block = DS::Block> + Send + 'static,
 {
     pub fn new(data_source: DS, chunk_builder: CB, message_sender: tokio::sync::mpsc::Sender<IngestMessage>) -> Self {
         let first_block = data_source.get_next_block();
@@ -265,7 +265,7 @@ where
     async fn with_blocking_builder<R, F>(&mut self, cb: F) -> R
     where
         F: FnOnce(&mut DataBuilder<CB>) -> R + Send + 'static,
-        R: Send + 'static
+        R: Send + 'static,
     {
         let mut builder = std::mem::take(&mut self.builder).unwrap();
 

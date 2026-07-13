@@ -135,7 +135,7 @@ pub fn make_irregular_block(
 pub fn make_schema(type_1: DataType, type_2: DataType, is_sorted: bool) -> Arc<Schema> {
     let schema = Arc::new(Schema::new(vec![
         Field::new("data", type_1, true),
-        Field::new("atad", type_2, false),
+        Field::new("atad", type_2, false)
     ]));
     match is_sorted {
         true => set_sort_key(schema, &[0]),

@@ -41,7 +41,7 @@ impl RunningQueryStats {
     pub fn report_metrics(&self, dataset_id: &DatasetId, client_id: &ClientId) {
         let labels = vec![
             ("client_id", client_id.as_str().to_owned()),
-            ("dataset_id", dataset_id.as_str().to_owned()),
+            ("dataset_id", dataset_id.as_str().to_owned())
         ];
 
         QUERIED_BLOCKS.get_or_create(&labels).observe(self.blocks_read as f64);

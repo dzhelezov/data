@@ -236,7 +236,7 @@ fn compaction_plan_test_execution(
     let total_blocks = block_sizes.iter().map(|v| v.iter().sum::<usize>()).sum::<usize>();
     let static_data = vec![
         (0..total_blocks as u16).collect::<Vec<u16>>(),
-        (0..total_blocks as u16).collect::<Vec<u16>>(),
+        (0..total_blocks as u16).collect::<Vec<u16>>()
     ];
 
     let (db, dataset_id) = setup_db();

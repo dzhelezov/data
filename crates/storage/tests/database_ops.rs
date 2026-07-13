@@ -268,7 +268,7 @@ fn chunk_reader() {
 
     let schema = Arc::new(Schema::new(vec![
         Field::new("data", DataType::UInt32, true),
-        Field::new("atad", DataType::UInt32, true),
+        Field::new("atad", DataType::UInt32, true)
     ]));
 
     let mut builder = db.new_table_builder(schema.clone());

@@ -90,7 +90,7 @@ async fn shutdown_signal() {
 
     tokio::select! {
         _ = ctrl_c => {},
-        _ = terminate => {},
+        _ = terminate => {}
     }
 }
 

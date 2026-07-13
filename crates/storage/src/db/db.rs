@@ -238,6 +238,27 @@ pub struct Database {
 }
 
 impl Database {
+    /// Read a database-wide RocksDB integer property, returning `None` on errors.
+    pub fn rocksdb_int_property(&self, name: &str) -> Option<u64> {
+        self.db.property_int_value(name).ok().flatten()
+    }
+
+    /// Read a column-family RocksDB integer property, returning `None` on errors.
+    pub fn rocksdb_int_property_cf(&self, cf: &str, name: &str) -> Option<u64> {
+        let cf = self.db.cf_handle(cf)?;
+        self.db.property_int_value_cf(cf, name).ok().flatten()
+    }
+
+    /// Return RocksDB's statistics dump when statistics collection is enabled.
+    pub fn rocksdb_statistics(&self) -> Option<String> {
+        self.options.get_statistics()
+    }
+
+    /// Return the column families opened by this database.
+    pub fn column_families(&self) -> &'static [&'static str] {
+        &[CF_DATASETS, CF_CHUNKS, CF_TABLES, CF_DIRTY_TABLES, CF_DELETED_TABLES]
+    }
+
     pub fn create_dataset(&self, id: DatasetId, kind: DatasetKind) -> anyhow::Result<()> {
         Tx::new(&self.db).run(|tx| {
             let label = tx.find_label_for_update(id)?;
@@ -291,7 +312,7 @@ impl Database {
 
     pub fn update_dataset<F, R>(&self, dataset_id: DatasetId, mut cb: F) -> anyhow::Result<R>
     where
-        F: FnMut(&mut DatasetUpdate<'_>) -> anyhow::Result<R>
+        F: FnMut(&mut DatasetUpdate<'_>) -> anyhow::Result<R>,
     {
         Tx::new(&self.db).run(|tx| {
             let mut upd = DatasetUpdate::new(tx, dataset_id)?;

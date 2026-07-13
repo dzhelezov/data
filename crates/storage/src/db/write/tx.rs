@@ -55,7 +55,7 @@ impl<'a> Tx<'a> {
 
     pub fn run<R, F>(self, mut cb: F) -> anyhow::Result<R>
     where
-        F: FnMut(&Self) -> anyhow::Result<R>
+        F: FnMut(&Self) -> anyhow::Result<R>,
     {
         let db = self.db;
         let mut tx = self;

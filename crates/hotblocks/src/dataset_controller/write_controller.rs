@@ -341,7 +341,7 @@ impl WriteController {
         first_block = chunk.first_block(),
         last_block = chunk.last_block(),
         last_block_hash = %chunk.last_block_hash(),
-        finalized_head = valuable(&finalized_head),
+        finalized_head = valuable(&finalized_head)
     ))]
     pub fn new_chunk(&mut self, finalized_head: Option<&BlockRef>, chunk: &StorageChunk) -> anyhow::Result<()> {
         // FIXME: accept self.first_block rollback limit

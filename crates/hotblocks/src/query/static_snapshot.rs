@@ -107,7 +107,7 @@ impl StaticChunkReader {
 
     pub fn with_reader<R, F>(&self, cb: F) -> R
     where
-        F: FnOnce(&ChunkReader<'_>) -> R
+        F: FnOnce(&ChunkReader<'_>) -> R,
     {
         self.inner.with_reader(cb)
     }
