@@ -16,7 +16,7 @@ use sqd_storage::db::{
     CF_BLOCK_HASHES, CF_CHUNKS, CF_DATASETS, CF_DELETED_TABLES, CF_DIRTY_TABLES, CF_TABLES, CF_TRANSACTION_HASHES,
     DatasetId, HashIndexWriteMetrics, ReadSnapshot
 };
-use tracing::error;
+use tracing::{error, warn};
 
 use crate::{query::QueryExecutorCollector, types::DBRef};
 
@@ -44,6 +44,46 @@ macro_rules! dataset_label {
 
 type Labels = Vec<(&'static str, String)>;
 
+const ROCKSDB_TICKERS: &[(&str, &str)] = &[
+    ("rocksdb.block.cache.hit", "block_cache_hit_total"),
+    ("rocksdb.block.cache.miss", "block_cache_miss_total"),
+    ("rocksdb.block.cache.data.hit", "block_cache_data_hit_total"),
+    ("rocksdb.block.cache.data.miss", "block_cache_data_miss_total"),
+    ("rocksdb.stall.micros", "stall_micros_total"),
+    ("rocksdb.bytes.read", "bytes_read_total"),
+    ("rocksdb.bytes.written", "bytes_written_total"),
+    ("rocksdb.compact.read.bytes", "compact_read_bytes_total"),
+    ("rocksdb.compact.write.bytes", "compact_write_bytes_total")
+];
+
+const ROCKSDB_HISTOGRAMS: &[(&str, &str)] = &[
+    ("rocksdb.db.write.stall", "db_write_stall"),
+    ("rocksdb.compaction.times.micros", "compaction_times_micros")
+];
+
+const MIN_SLOW_RESPONSE_BYTES: u64 = 10_000;
+
+#[derive(Debug, Copy, Clone)]
+pub struct SlowResponseConfig {
+    ttfb_threshold: Duration,
+    min_bytes_per_second: u64
+}
+
+impl SlowResponseConfig {
+    pub fn new(ttfb_threshold_ms: u64, min_bytes_per_second: u64) -> Self {
+        Self {
+            ttfb_threshold: Duration::from_millis(ttfb_threshold_ms),
+            min_bytes_per_second
+        }
+    }
+}
+
+impl Default for SlowResponseConfig {
+    fn default() -> Self {
+        Self::new(2_000, 50_000)
+    }
+}
+
 fn buckets(start: f64, count: usize) -> impl Iterator<Item = f64> {
     std::iter::successors(Some(start), |x| Some(x * 10.))
         .flat_map(|x| [x, x * 1.5, x * 2.5, x * 5.0])
@@ -53,6 +93,7 @@ fn buckets(start: f64, count: usize) -> impl Iterator<Item = f64> {
 pub static HTTP_STATUS: LazyLock<Family<Labels, Counter>> = LazyLock::new(Default::default);
 pub static HTTP_TTFB: LazyLock<Family<Labels, Histogram>> =
     LazyLock::new(|| Family::new_with_constructor(|| Histogram::new(buckets(0.001, 20))));
+pub static SLOW_RESPONSES: LazyLock<Family<Labels, Counter>> = LazyLock::new(Default::default);
 
 pub static QUERY_ERROR_TOO_MANY_TASKS: LazyLock<Counter> = LazyLock::new(Default::default);
 pub static QUERY_ERROR_TOO_MANY_DATA_WAITERS: LazyLock<Counter> = LazyLock::new(Default::default);
@@ -161,9 +202,174 @@ pub fn report_query_too_many_data_waiters_error() {
     QUERY_ERROR_TOO_MANY_DATA_WAITERS.inc();
 }
 
-pub fn report_http_response(labels: &Vec<(&'static str, String)>, to_first_byte: Duration) {
+pub fn report_http_response(
+    labels: &Vec<(&'static str, String)>,
+    to_first_byte: Duration,
+    long_poll: bool,
+    slow_response_config: SlowResponseConfig
+) {
     HTTP_STATUS.get_or_create(&labels).inc();
-    HTTP_TTFB.get_or_create(&labels).observe(to_first_byte.as_secs_f64());
+
+    let mut ttfb_labels = labels.clone();
+    ttfb_labels.push(("long_poll", long_poll.to_string()));
+    HTTP_TTFB
+        .get_or_create(&ttfb_labels)
+        .observe(to_first_byte.as_secs_f64());
+
+    if !long_poll && to_first_byte > slow_response_config.ttfb_threshold {
+        let Some(dataset) = response_dataset(labels) else {
+            return;
+        };
+
+        report_slow_response(dataset, "ttfb");
+        warn!(
+            dataset,
+            ttfb_ms = duration_millis(to_first_byte),
+            bytes = 0_u64,
+            bytes_per_sec = 0.0,
+            is_long_poll = long_poll,
+            reason = "ttfb",
+            "slow response detected"
+        );
+    }
+}
+
+pub fn report_stream_slow_response(
+    dataset_id: DatasetId,
+    to_first_byte: Duration,
+    bytes: u64,
+    duration: Duration,
+    long_poll: bool,
+    slow_response_config: SlowResponseConfig
+) {
+    if long_poll || bytes < MIN_SLOW_RESPONSE_BYTES || duration.is_zero() {
+        return;
+    }
+
+    let bytes_per_sec = bytes as f64 / duration.as_secs_f64();
+    if bytes_per_sec >= slow_response_config.min_bytes_per_second as f64 {
+        return;
+    }
+
+    report_slow_response(dataset_id.as_str(), "throughput");
+    warn!(
+        dataset = dataset_id.as_str(),
+        ttfb_ms = duration_millis(to_first_byte),
+        bytes,
+        bytes_per_sec,
+        is_long_poll = long_poll,
+        reason = "throughput",
+        "slow response detected"
+    );
+}
+
+fn response_dataset(labels: &Labels) -> Option<&str> {
+    labels
+        .iter()
+        .find_map(|(key, value)| (*key == "dataset_name").then_some(value.as_str()))
+}
+
+fn report_slow_response(dataset: &str, reason: &'static str) {
+    let labels = vec![("dataset", dataset.to_owned()), ("reason", reason.to_owned())];
+    SLOW_RESPONSES.get_or_create(&labels).inc();
+}
+
+fn duration_millis(duration: Duration) -> u64 {
+    duration.as_millis().try_into().unwrap_or(u64::MAX)
+}
+
+#[derive(Debug, PartialEq)]
+struct ParsedStatistic<'a> {
+    name: &'a str,
+    count: Option<u64>,
+    sum: Option<f64>
+}
+
+fn parse_rocksdb_statistic(line: &str) -> Option<ParsedStatistic<'_>> {
+    let tokens: Vec<_> = line.split_whitespace().collect();
+    let name = *tokens.first()?;
+    let mut count = None;
+    let mut sum = None;
+    let mut index = 1;
+
+    while index < tokens.len() {
+        let key = tokens[index].trim_end_matches(':');
+        if key != "COUNT" && key != "SUM" {
+            index += 1;
+            continue;
+        }
+
+        index += 1;
+        if tokens.get(index) == Some(&":") {
+            index += 1;
+        }
+        let value = tokens.get(index)?.trim_end_matches(',');
+        // `key` is COUNT or SUM here (guarded above); avoid an unreachable arm on the scrape path.
+        if key == "COUNT" {
+            count = value.parse().ok();
+        } else {
+            sum = value.parse().ok();
+        }
+        index += 1;
+    }
+
+    (count.is_some() || sum.is_some()).then_some(ParsedStatistic { name, count, sum })
+}
+
+fn encode_rocksdb_statistics(encoder: &mut DescriptorEncoder, statistics: &str) -> Result<(), std::fmt::Error> {
+    // Statistics values are cumulative. They are exported as gauges to preserve the raw
+    // cumulative value (apply rate() in PromQL). Converting to the Counter metric type is a
+    // follow-up: the OpenMetrics `_total` suffix must be handled to avoid a doubled suffix on
+    // the already-`_total`-named tickers, and the histogram count/sum need proper typing.
+    for line in statistics.lines() {
+        let Some(statistic) = parse_rocksdb_statistic(line) else {
+            continue;
+        };
+
+        if let Some((_, metric_suffix)) = ROCKSDB_TICKERS.iter().find(|(name, _)| *name == statistic.name) {
+            if let Some(value) = statistic.count {
+                let metric_name = format!("hotblocks_rocksdb_{metric_suffix}");
+                encoder
+                    .encode_descriptor(
+                        &metric_name,
+                        "Cumulative RocksDB statistics ticker",
+                        None,
+                        MetricType::Gauge
+                    )?
+                    .encode_gauge(&value)?;
+            }
+            continue;
+        }
+
+        let Some((_, metric_suffix)) = ROCKSDB_HISTOGRAMS.iter().find(|(name, _)| *name == statistic.name) else {
+            continue;
+        };
+
+        if let Some(value) = statistic.count {
+            let metric_name = format!("hotblocks_rocksdb_{metric_suffix}_count");
+            encoder
+                .encode_descriptor(
+                    &metric_name,
+                    "Cumulative RocksDB statistics histogram count",
+                    None,
+                    MetricType::Gauge
+                )?
+                .encode_gauge(&value)?;
+        }
+        if let Some(value) = statistic.sum {
+            let metric_name = format!("hotblocks_rocksdb_{metric_suffix}_sum");
+            encoder
+                .encode_descriptor(
+                    &metric_name,
+                    "Cumulative RocksDB statistics histogram sum",
+                    None,
+                    MetricType::Gauge
+                )?
+                .encode_gauge(&value)?;
+        }
+    }
+
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -434,6 +640,13 @@ fn collect_rocksdb_metrics(encoder: &mut DescriptorEncoder, db: &DBRef) -> anyho
         }
     }
 
+    // Cumulative RocksDB statistics tickers/histograms (block-cache, stalls, bytes read/written,
+    // compaction). Broader-instrumentation delta over upstream's intrinsic-property gauges; no-ops
+    // unless statistics collection is enabled on the database.
+    if let Some(statistics) = db.get_statistics() {
+        encode_rocksdb_statistics(encoder, &statistics)?;
+    }
+
     Ok(())
 }
 
@@ -463,6 +676,11 @@ pub fn build_metrics_registry() -> Registry {
         "write_duration_seconds",
         "Write-pipeline stage duration; hash-index stages are nested within commit or retention",
         WRITE_DURATION.clone()
+    );
+    registry.register(
+        "slow_responses",
+        "Number of non-long-poll responses that exceeded a latency or throughput threshold",
+        SLOW_RESPONSES.clone()
     );
 
     registry.register("stream_bytes", "Number of bytes per stream", STREAM_BYTES.clone());
@@ -574,6 +792,30 @@ mod tests {
                     && line.contains("outcome=\"error\"")
             }),
             "missing error outcome:\n{output}"
+        );
+    }
+
+    #[test]
+    fn parses_ticker_statistic() {
+        assert_eq!(
+            parse_rocksdb_statistic("rocksdb.block.cache.hit COUNT : 12345"),
+            Some(ParsedStatistic {
+                name: "rocksdb.block.cache.hit",
+                count: Some(12_345),
+                sum: None
+            })
+        );
+    }
+
+    #[test]
+    fn parses_histogram_statistic() {
+        assert_eq!(
+            parse_rocksdb_statistic("rocksdb.db.write.stall P50 : 1.0 P95 : 2.0 P99 : 3.0 COUNT : 7 SUM : 42.5"),
+            Some(ParsedStatistic {
+                name: "rocksdb.db.write.stall",
+                count: Some(7),
+                sum: Some(42.5)
+            })
         );
     }
 

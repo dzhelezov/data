@@ -31,6 +31,9 @@ use crate::{
 
 const DEFAULT_CLIENT_ID: &str = "unknown";
 
+#[derive(Clone, Copy)]
+struct LongPoll(bool);
+
 macro_rules! json_ok {
     ($json:expr) => {
         (StatusCode::OK, Json($json)).into_response()
@@ -101,6 +104,7 @@ pub async fn middleware(mut req: Request, next: axum::middleware::Next) -> impl 
     let start = Instant::now();
 
     let app = req.extensions().get::<Arc<App>>().expect("App extension should be set");
+    let slow_response_config = app.slow_response_config;
 
     let client_id = req
         .headers()
@@ -130,6 +134,7 @@ pub async fn middleware(mut req: Request, next: axum::middleware::Next) -> impl 
         .map(|labels| labels.0)
         .unwrap_or(Vec::new());
     labels.push(("status", response.status().as_str().to_owned()));
+    let long_poll = response.extensions().get::<LongPoll>().map_or(false, |value| value.0);
 
     span.in_scope(|| {
         tracing::debug!(
@@ -143,7 +148,7 @@ pub async fn middleware(mut req: Request, next: axum::middleware::Next) -> impl 
         );
     });
 
-    crate::metrics::report_http_response(&labels, latency);
+    crate::metrics::report_http_response(&labels, latency, long_poll, slow_response_config);
 
     response
 }
@@ -247,7 +252,7 @@ async fn stream_internal(
         return text!(StatusCode::BAD_REQUEST, "{}", err);
     }
 
-    let query_result = if finalized {
+    let query_outcome = if finalized {
         app.query_service
             .query_finalized(&dataset, query, client_id, encoding)
             .await
@@ -255,7 +260,7 @@ async fn stream_internal(
         app.query_service.query(&dataset, query, client_id, encoding).await
     };
 
-    match query_result {
+    let mut response = match query_outcome.response {
         Ok(stream) => {
             let mut res = Response::builder()
                 .status(200)
@@ -282,7 +287,9 @@ async fn stream_internal(
             res.body(body).unwrap()
         }
         Err(err) => error_to_response(err, &body)
-    }
+    };
+    response.extensions_mut().insert(LongPoll(query_outcome.long_poll));
+    response
 }
 
 fn stream_query_response(mut stream: QueryResponse) -> impl TryStream<Ok = Bytes, Error = BoxError> {
@@ -588,7 +595,7 @@ async fn get_metadata(
                 "dataset": dataset_id,
                 "aliases": [],
                 "real_time": true,
-                "start_block": first_chunk.map(|chunk| chunk.first_block()),
+                "start_block": first_chunk.map(|chunk| chunk.first_block())
             }})
         })
 }

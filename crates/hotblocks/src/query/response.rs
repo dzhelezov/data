@@ -14,7 +14,8 @@ use crate::{
     encoding::ContentEncoding,
     errors::Busy,
     metrics::{
-        STREAM_BLOCKS, STREAM_BLOCKS_PER_SECOND, STREAM_BYTES, STREAM_BYTES_PER_SECOND, STREAM_CHUNKS, STREAM_DURATIONS
+        STREAM_BLOCKS, STREAM_BLOCKS_PER_SECOND, STREAM_BYTES, STREAM_BYTES_PER_SECOND, STREAM_CHUNKS,
+        STREAM_DURATIONS, SlowResponseConfig, report_stream_slow_response
     },
     types::{ClientId, DBRef}
 };
@@ -28,14 +29,17 @@ pub struct QueryResponse {
     dataset_id: DatasetId,
     client_id: ClientId,
     stats: QueryStreamStats,
-    time_limit: Duration
+    time_limit: Duration,
+    long_poll: bool,
+    slow_response_config: SlowResponseConfig
 }
 
 pub struct QueryStreamStats {
     response_chunks: u64,
     response_blocks: u64,
     response_bytes: u64,
-    start_time: Instant
+    start_time: Instant,
+    to_first_byte: Duration
 }
 
 impl QueryStreamStats {
@@ -44,7 +48,8 @@ impl QueryStreamStats {
             response_chunks: 0,
             response_blocks: 0,
             response_bytes: 0,
-            start_time: Instant::now()
+            start_time: Instant::now(),
+            to_first_byte: Duration::ZERO
         }
     }
 
@@ -54,7 +59,14 @@ impl QueryStreamStats {
         self.response_blocks = self.response_blocks.saturating_add(running_stats.blocks_returned);
     }
 
-    fn report_metrics(&self, dataset_id: &DatasetId, client_id: &ClientId) {
+    fn report_metrics(
+        &self,
+        dataset_id: &DatasetId,
+        client_id: &ClientId,
+        long_poll: bool,
+        slow_response_config: SlowResponseConfig,
+        completed: bool
+    ) {
         let labels = vec![
             ("client_id", client_id.as_str().to_owned()),
             ("dataset_name", dataset_id.as_str().to_owned()),
@@ -70,10 +82,22 @@ impl QueryStreamStats {
         STREAM_BLOCKS.get_or_create(&labels).observe(blocks);
         STREAM_CHUNKS.get_or_create(&labels).observe(chunks);
         if duration > 0.0 {
-            STREAM_BYTES_PER_SECOND.get_or_create(&labels).observe(bytes / duration);
+            let bytes_per_second = bytes / duration;
+            STREAM_BYTES_PER_SECOND.get_or_create(&labels).observe(bytes_per_second);
             STREAM_BLOCKS_PER_SECOND
                 .get_or_create(&labels)
                 .observe(blocks / duration);
+        }
+
+        if completed {
+            report_stream_slow_response(
+                *dataset_id,
+                self.to_first_byte,
+                self.response_bytes,
+                self.start_time.elapsed(),
+                long_poll,
+                slow_response_config
+            );
         }
     }
 }
@@ -87,7 +111,9 @@ impl QueryResponse {
         only_finalized: bool,
         time_limit: Option<Duration>,
         client_id: ClientId,
-        encoding: ContentEncoding
+        encoding: ContentEncoding,
+        long_poll: bool,
+        slow_response_config: SlowResponseConfig
     ) -> anyhow::Result<Self> {
         let Some(slot) = executor.get_slot() else { bail!(Busy) };
 
@@ -108,7 +134,9 @@ impl QueryResponse {
             stats,
             dataset_id,
             client_id,
-            time_limit
+            time_limit,
+            long_poll,
+            slow_response_config
         };
 
         Ok(response)
@@ -116,6 +144,10 @@ impl QueryResponse {
 
     pub fn finalized_head(&self) -> Option<&BlockRef> {
         self.finalized_head.as_ref()
+    }
+
+    pub(super) fn set_time_to_first_byte(&mut self, duration: Duration) {
+        self.stats.to_first_byte = duration;
     }
 
     pub async fn next_data_pack(&mut self) -> anyhow::Result<Option<Bytes>> {
@@ -186,7 +218,13 @@ impl QueryResponse {
 
 impl Drop for QueryResponse {
     fn drop(&mut self) {
-        self.stats.report_metrics(&self.dataset_id, &self.client_id)
+        self.stats.report_metrics(
+            &self.dataset_id,
+            &self.client_id,
+            self.long_poll,
+            self.slow_response_config,
+            self.runner.is_none()
+        )
     }
 }
 
