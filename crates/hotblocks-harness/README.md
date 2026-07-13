@@ -124,7 +124,20 @@ Fixed in `crates/data-client/src/reqwest/lines.rs`; pinned by a unit test there 
   matrix.
 - **CT-4 (fork/finality corpus)** — `Harness::fork()` and the model's `resolve_fork` /
   `Finalize::IntegrityFault` are implemented and unit-tested; the follower implements the
-  normative CONFLICT recovery of 04 §7. What is missing is the scripts.
+  normative CONFLICT recovery of 04 §7. What is missing is the scripts. The first four, in
+  order:
+  1. **Shallow reorg — fin stability.** Fork strictly above `fin`; assert the REPLACE
+     commits, anchored followers recover via CONFLICT, and the finalized head never blips:
+     `x-sqd-finalized-head-*` present on every response and `/finalized-head` non-null on
+     every poll throughout the reorg (INV-12/24, IB-6). Pins the audited claim that a fork
+     cannot clear `fin` — only retention can.
+  2. **Fork below `fin`, hints all mismatching.** Assert a REPLACE from `fin + 1` or an
+     alarmed integrity fault — never a commit whose base ≤ `fin`, never a silent
+     replacement of the finalized prefix (GAP-22).
+  3. **Divergence below the window.** Assert escalation to RESET instead of the infinite
+     60 s park (GAP-3, WP-6b).
+  4. **Finality conflict.** A report whose hash contradicts the stored block below the head
+     is an integrity fault, not an acceptance (GAP-4, WP-8).
 - **CT-5 (error taxonomy)** — `Model::predict_query` returns the outcome class for any query;
   `Client::query` already classifies every response. What is missing is the request matrix.
 - **CT-7 (soak/space)** — needs `OB-6`-style space accounting; the retention model transition
@@ -136,7 +149,10 @@ Fixed in `crates/data-client/src/reqwest/lines.rs`; pinned by a unit test there 
 
 ## Known open questions
 
-- With `includeAllBlocks: false`, the query engine appears to emit a header-only record for
-  blocks with no matching items (see `crates/query/fixtures/hyperliquid/queries/coin_fills`).
-  Whether that is the coverage carrier, an accident, or something else is unresolved — the model
-  predicts emissions only under `include_all` until it is. This is a CT-5/INV-22 question.
+- ~~Whether the header-only records emitted under `includeAllBlocks: false` are the coverage
+  carrier, an accident, or something else~~ — **resolved by the 2026-07-12 spec↔impl audit**:
+  they are the carrier. The plan force-selects the first and last covered block of every chunk
+  range, and RP-9 now specifies the behavior: the coverage-end block is always emitted
+  (header-only when unmatched), further boundary markers are layout-dependent and exempt from
+  INV-22 determinism. Follow-up here: teach the model to emit the coverage-end record and the
+  comparator the marker exemption — then filtered (non-`include_all`) scans become testable.
