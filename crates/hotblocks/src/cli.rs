@@ -12,7 +12,7 @@ use tracing::info;
 use crate::{
     data_service::{DataService, DataServiceRef},
     dataset_config::{DatasetConfig, RetentionConfig},
-    metrics::{DatasetMetricsCollector, RocksDbCollector},
+    metrics::{DatasetMetricsCollector, RocksDbCollector, SlowResponseConfig},
     query::{QueryService, QueryServiceRef},
     types::DBRef
 };
@@ -44,6 +44,14 @@ pub struct CLI {
     /// Max number of queries waiting for new block arrival
     #[arg(long, value_name = "N", default_value = "64000")]
     pub query_max_data_waiters: usize,
+
+    /// TTFB threshold for reporting a non-long-poll response as slow.
+    #[arg(long, value_name = "MS", default_value = "2000")]
+    pub slow_response_ttfb_ms: u64,
+
+    /// Minimum throughput for non-trivial, non-long-poll response streams.
+    #[arg(long, value_name = "BYTES_PER_SECOND", default_value = "50000")]
+    pub slow_response_min_bps: u64,
 
     #[arg(long, default_value = "3000")]
     pub port: u16,
@@ -115,7 +123,8 @@ pub struct App {
     pub query_service: QueryServiceRef,
     pub api_controlled_datasets: BTreeSet<DatasetId>,
     pub metrics_registry: prometheus_client::registry::Registry,
-    pub known_clients: HashSet<String>
+    pub known_clients: HashSet<String>,
+    pub slow_response_config: SlowResponseConfig
 }
 
 impl CLI {
@@ -147,6 +156,8 @@ impl CLI {
             "RocksDB opened"
         );
 
+        let slow_response_config = SlowResponseConfig::new(self.slow_response_ttfb_ms, self.slow_response_min_bps);
+
         let mut metrics_registry = crate::metrics::build_metrics_registry();
         metrics_registry.register_collector(Box::new(DatasetMetricsCollector {
             db: db.clone(),
@@ -166,6 +177,7 @@ impl CLI {
         let query_service = {
             let mut builder = QueryService::builder(db.clone());
             builder.set_max_data_waiters(self.query_max_data_waiters);
+            builder.set_slow_response_config(slow_response_config);
 
             if let Some(size) = self.query_task_queue {
                 builder.set_max_pending_query_tasks(size);
@@ -188,7 +200,8 @@ impl CLI {
             query_service,
             api_controlled_datasets,
             metrics_registry,
-            known_clients
+            known_clients,
+            slow_response_config
         })
     }
 }

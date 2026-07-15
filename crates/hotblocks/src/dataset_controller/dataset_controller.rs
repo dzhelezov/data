@@ -707,7 +707,7 @@ async fn compaction_loop(db: DBRef, dataset_id: DatasetId, mut enabled: tokio::s
                         size = merged_chunks.iter().map(|c| c.size).sum::<usize>(),
                         max_merged_size = merged_chunks.iter().map(|c| c.size).max().unwrap(),
                         "merged {} chunks",
-                        merged_chunks.len(),
+                        merged_chunks.len()
                     );
                     skips = 0;
                 }
