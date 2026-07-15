@@ -10,7 +10,7 @@ use bytes::Bytes;
 use futures::{future::BoxFuture, FutureExt, StreamExt};
 use reqwest::{Client, IntoUrl, Response, StatusCode, Url};
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{json, Value};
 use sqd_primitives::{BlockNumber, BlockRef};
 
 use super::lines::LineStream;
@@ -66,8 +66,23 @@ impl ReqwestDataClient {
                 .insert("parentBlockHash".into(), req.parent_block_hash.clone().into());
         }
 
+        self.stream_query("stream", body).await
+    }
+
+    /// Send a caller-provided query to a stream endpoint while retaining this
+    /// client's NDJSON, finalized-head, and fork response handling.
+    ///
+    /// This is useful for typed portal queries whose field projection cannot
+    /// be represented by [`BlockStreamRequest`]. Callers are responsible for
+    /// including cursor fields such as `fromBlock` and `parentBlockHash`.
+    pub async fn stream_query(&self, endpoint: &str, body: Value) -> anyhow::Result<BlockStreamResponse<Bytes>> {
+        ensure!(
+            !endpoint.is_empty() && !endpoint.contains('/'),
+            "invalid stream endpoint"
+        );
+
         let mut url = self.url.as_ref().clone();
-        url.path_segments_mut().unwrap().push("stream");
+        url.path_segments_mut().unwrap().push(endpoint);
 
         let res = self.http.post(url).json(&body).send().await?;
 
