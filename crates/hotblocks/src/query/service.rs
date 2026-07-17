@@ -172,6 +172,8 @@ impl QueryService {
         QueryOutcome { response, long_poll }
     }
 
+    // `&self` is reserved for a future config-driven long-poll threshold; the body
+    // reads only its arguments today.
     fn is_long_poll(&self, dataset: &DatasetController, query: &Query, finalized: bool) -> anyhow::Result<bool> {
         // Adopt upstream 546c1ac: DatasetKind::from_query is now fallible; bind once.
         let query_kind = DatasetKind::from_query(query)?;

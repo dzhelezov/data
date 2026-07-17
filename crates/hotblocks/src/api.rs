@@ -821,7 +821,7 @@ async fn get_metadata(
                 "dataset": dataset_id,
                 "aliases": [],
                 "real_time": true,
-                "start_block": first_chunk.map(|chunk| chunk.first_block())
+                "start_block": first_chunk.map(|chunk| chunk.first_block()),
             }})
         })
 }
