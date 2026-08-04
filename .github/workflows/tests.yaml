@@ -58,12 +58,15 @@ jobs:
 
   test:
     name: Test
-    # Fork PRs stay on GitHub-hosted (untrusted code); trusted events use self-hosted. See the
-    # clippy job above for the rationale.
-    runs-on: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) && fromJSON('["ubuntu-latest"]') || fromJSON('["self-hosted", "dev-server"]') }}
+    # The test fixtures are stored in Git LFS. The self-hosted dev-server runner does not
+    # currently provide git-lfs, so checkout fails before tests start. Keep this job on a
+    # GitHub-hosted image, which includes Git LFS; clippy still uses the warm self-hosted cache.
+    runs-on: ubuntu-latest
     if: github.event_name == 'push' || !github.event.pull_request.draft
     steps:
       - uses: actions/checkout@v4
+        with:
+          lfs: true
       - uses: dsherret/rust-toolchain-file@v1
       - uses: Swatinem/rust-cache@v2
         with:
