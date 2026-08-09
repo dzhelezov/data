@@ -698,6 +698,18 @@ mod tests {
 
         let populated: Block = serde_json::from_value(block_json(true)).unwrap();
         assert_eq!(populated.transactions.len(), 1);
+
+        // A missing key and an explicit empty list must be equivalent...
+        let mut explicit_empty = block_json(false);
+        explicit_empty["transactions"] = json!([]);
+        let explicit_empty: Block = serde_json::from_value(explicit_empty).unwrap();
+        assert!(explicit_empty.transactions.is_empty());
+
+        // ...while an explicit `null` is still rejected (the portal omits the key,
+        // it does not send null — so defaulting must not swallow a malformed null).
+        let mut null_txs = block_json(false);
+        null_txs["transactions"] = Value::Null;
+        assert!(serde_json::from_value::<Block>(null_txs).is_err());
     }
 
     #[test]
