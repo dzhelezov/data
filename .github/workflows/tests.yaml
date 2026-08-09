@@ -63,9 +63,11 @@ jobs:
     runs-on: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) && fromJSON('["ubuntu-latest"]') || fromJSON('["self-hosted", "dev-server"]') }}
     if: github.event_name == 'push' || !github.event.pull_request.draft
     steps:
+      # No LFS-tracked files exist in this repo (no .gitattributes lfs filters), and the
+      # self-hosted `dev-server` runner has no git-lfs binary, so `lfs: true` made every
+      # Test run fail at checkout ("Unable to locate executable file: git-lfs"). The clippy
+      # job checks out without LFS and builds fine; match it.
       - uses: actions/checkout@v4
-        with:
-          lfs: true
       - uses: dsherret/rust-toolchain-file@v1
       - uses: Swatinem/rust-cache@v2
         with:
