@@ -432,6 +432,10 @@ pub struct StateDiff {
 #[serde(rename_all = "camelCase")]
 pub struct Block {
     pub header: BlockHeader,
+    // The portal `/stream` response omits `transactions` entirely for zero-tx
+    // blocks (omit-empty serialization), so treat a missing key as an empty set
+    // rather than a hard `missing field` error that would stall ingest.
+    #[serde(default)]
     pub transactions: Vec<Transaction>,
     pub logs: Option<Vec<Log>>,
     pub traces: Option<Vec<Trace>>,
@@ -487,7 +491,7 @@ impl sqd_primitives::Block for Block {
 mod tests {
     use serde_json::{json, Value};
 
-    use super::{BlockHeader, Transaction};
+    use super::{Block, BlockHeader, Transaction};
 
     fn quantity(value: u64, as_hex: bool) -> Value {
         if as_hex {
@@ -673,6 +677,27 @@ mod tests {
             integer_key_authorization.limits.as_ref().unwrap()[0].limit,
             hex_key_authorization.limits.as_ref().unwrap()[0].limit
         );
+    }
+
+    fn block_json(with_transactions: bool) -> Value {
+        let mut block = json!({ "header": block_header_json(false) });
+        if with_transactions {
+            block["transactions"] = json!([transaction_json(false)]);
+        }
+        block
+    }
+
+    #[test]
+    fn block_missing_transactions_field_defaults_to_empty() {
+        // The portal `/stream` response omits the `transactions` key entirely for
+        // zero-tx blocks. Deserialization must accept that as an empty transaction
+        // set rather than failing with `missing field transactions`, which would
+        // stall hotblocks ingest on the first empty block.
+        let empty: Block = serde_json::from_value(block_json(false)).unwrap();
+        assert!(empty.transactions.is_empty());
+
+        let populated: Block = serde_json::from_value(block_json(true)).unwrap();
+        assert_eq!(populated.transactions.len(), 1);
     }
 
     #[test]
