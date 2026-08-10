@@ -39,6 +39,8 @@ pub struct DatasetSpec {
     pub id: String,
     pub kind: String,
     pub retention: Retention,
+    /// Preserve response-aligned chunks for tests that exercise physical layout boundaries.
+    pub disable_compaction: bool,
     pub sources: Vec<String>
 }
 
@@ -59,6 +61,7 @@ pub struct Sut {
     dir: TempDir,
     port: u16,
     child: Option<Child>,
+    shutdown_started: Option<Instant>,
     /// How long the last boot took to accept connections (SLI-5).
     pub last_startup: Duration
 }
@@ -78,6 +81,7 @@ impl Sut {
             cfg,
             dir,
             child: None,
+            shutdown_started: None,
             last_startup: Duration::ZERO
         };
         sut.write_config()?;
@@ -116,30 +120,50 @@ impl Sut {
         };
         child.kill().await.context("failed to kill the SUT")?;
         self.child = None;
+        self.shutdown_started = None;
         Ok(())
     }
 
-    /// SIGTERM and wait for the drain-and-exit (LIV-12, `P-SHUTDOWN`).
-    pub async fn stop(&mut self) -> Result<ShutdownReport> {
-        let Some(mut child) = self.child.take() else {
+    /// Send SIGTERM without waiting, so a test can observe the drain sequence in progress.
+    pub fn signal_shutdown(&mut self) -> Result<()> {
+        let Some(child) = self.child.as_ref() else {
             bail!("the SUT is not running")
         };
         let pid = child.id().context("the SUT has no pid")? as i32;
-        let started = Instant::now();
+        ensure!(self.shutdown_started.is_none(), "shutdown was already requested");
 
         // SAFETY: `pid` names a child of this process that has not been reaped.
-        unsafe { libc::kill(pid, libc::SIGTERM) };
+        if unsafe { libc::kill(pid, libc::SIGTERM) } != 0 {
+            return Err(std::io::Error::last_os_error()).context("failed to send SIGTERM to the SUT");
+        }
+        self.shutdown_started = Some(Instant::now());
+        Ok(())
+    }
 
-        match tokio::time::timeout(Duration::from_secs(60), child.wait()).await {
+    /// Wait for a previously requested shutdown to finish.
+    pub async fn wait_for_shutdown(&mut self, timeout: Duration) -> Result<ShutdownReport> {
+        let Some(_) = self.child.as_ref() else {
+            bail!("the SUT is not running")
+        };
+        let started = self.shutdown_started.take().context("shutdown was not requested")?;
+        let mut child = self.child.take().expect("checked above");
+
+        match tokio::time::timeout(timeout, child.wait()).await {
             Ok(status) => Ok(ShutdownReport {
                 status: status.context("failed to wait for the SUT")?,
                 took: started.elapsed()
             }),
             Err(_) => {
                 child.kill().await.ok();
-                bail!("the SUT did not exit within 60s of SIGTERM")
+                bail!("the SUT did not exit within {timeout:?} of SIGTERM")
             }
         }
+    }
+
+    /// SIGTERM and wait for the drain-and-exit (LIV-12, `P-SHUTDOWN`).
+    pub async fn stop(&mut self) -> Result<ShutdownReport> {
+        self.signal_shutdown()?;
+        self.wait_for_shutdown(Duration::from_secs(60)).await
     }
 
     /// The tail of the service log, minus the HTTP access log — the harness's own polling makes
@@ -184,6 +208,7 @@ impl Sut {
             .with_context(|| format!("failed to spawn {}", self.cfg.bin.display()))?;
 
         self.child = Some(child);
+        self.shutdown_started = None;
         self.await_ready(started).await?;
         self.last_startup = started.elapsed();
         Ok(())
@@ -239,6 +264,7 @@ impl Sut {
                 Retention::Api => yaml.push_str("  retention_strategy: Api\n"),
                 Retention::None => yaml.push_str("  retention_strategy: None\n")
             }
+            yaml.push_str(&format!("  disable_compaction: {}\n", ds.disable_compaction));
             yaml.push_str("  data_sources:\n");
             for src in &ds.sources {
                 yaml.push_str(&format!("    - \"{src}\"\n"));

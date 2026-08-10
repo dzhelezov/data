@@ -56,6 +56,16 @@ pub struct CLI {
     #[arg(long, default_value = "3000")]
     pub port: u16,
 
+    /// After SIGTERM, keep serving for this long while `/ready` reports 503, so the
+    /// orchestrator withdraws our endpoint before any connection closes.
+    #[arg(long, value_name = "SECS", default_value = "25")]
+    pub pre_drain_grace_secs: u64,
+
+    /// Hard cap on the drain that follows. The orchestrator's kill timeout must exceed
+    /// `pre_drain_grace + drain_timeout`.
+    #[arg(long, value_name = "SECS", default_value = "25")]
+    pub drain_timeout_secs: u64,
+
     /// Enable rocksdb stats collection
     #[arg(long)]
     pub rocksdb_stats: bool,
@@ -75,6 +85,28 @@ pub struct CLI {
     /// Defaults to the core count, clamped to 2..=8.
     #[arg(long, value_name = "N")]
     pub rocksdb_max_background_jobs: Option<usize>,
+
+    /// `CF_TABLES` memtable size. RocksDB's 64 MB default flushes small L0 files
+    /// continuously; the resulting compaction churn is most of the device write
+    /// bill, and writes stop whenever the flush of one buffer has not finished
+    /// before the next fills (measured: `immutable_memtables` pegged at its
+    /// ceiling wherever writes stopped).
+    #[arg(long, value_name = "MB", default_value = "64")]
+    pub rocksdb_write_buffer_mb: usize,
+
+    /// `CF_TABLES` memtables before writes stop. The default 2 leaves exactly one
+    /// buffer of headroom while its predecessor flushes.
+    #[arg(long, value_name = "N", default_value = "2")]
+    pub rocksdb_max_write_buffers: i32,
+
+    /// Target size of the LSM base level. With ~60 GB live and the default
+    /// multiplier of 10, this decides how many levels deep the ladder runs, and
+    /// a byte is rewritten once per level it descends. The default 256 MB is
+    /// smaller than one 512 MB memtable's flush, so L0 currently arrives larger
+    /// than the level it merges into. Unmeasured at full data size; validate boot
+    /// time and compaction behavior before raising it.
+    #[arg(long, value_name = "MB", default_value = "256")]
+    pub rocksdb_level_base_mb: usize,
 
     /// Rewrite every table SST older than this, collecting dead data that never made a file
     /// tombstone-dense enough for the deletion collector. Lower means faster reclaim and
@@ -111,6 +143,17 @@ pub struct CLI {
     #[arg(long)]
     pub transaction_hash_index: bool,
 
+    /// Chunks that never grew past this many buffered bytes are prepared in
+    /// memory at flush; larger ones spill to temp files while accumulating.
+    /// 0 forces the temp-file path for every chunk.
+    #[arg(
+        long,
+        value_name = "BYTES",
+        env = "SQD_SPILL_BOUND_BYTES",
+        default_value_t = crate::dataset_controller::DEFAULT_SPILL_BOUND_BYTES
+    )]
+    pub spill_bound_bytes: usize,
+
     /// Known client IDs for metrics labeling. Client IDs not in this list
     /// will be reported as "unknown" to prevent metrics cardinality abuse.
     #[arg(long = "known-client", value_name = "ID")]
@@ -138,6 +181,9 @@ impl CLI {
             .with_max_log_file_size(self.rocksdb_max_log_file_size)
             .with_keep_log_file_num(self.rocksdb_keep_log_file_num)
             .with_periodic_compaction_secs(self.rocksdb_periodic_compaction_secs)
+            .with_write_buffer_mb(self.rocksdb_write_buffer_mb)
+            .with_max_write_buffers(self.rocksdb_max_write_buffers)
+            .with_level_base_mb(self.rocksdb_level_base_mb)
             .with_block_hash_index(self.block_hash_index)
             .with_transaction_hash_index(self.transaction_hash_index);
 
@@ -170,7 +216,7 @@ impl CLI {
             .filter_map(|(id, cfg)| matches!(cfg.retention_strategy, RetentionConfig::Api { .. }).then_some(*id))
             .collect();
 
-        let data_service = DataService::start(db.clone(), datasets, self.startup_disk_reclaim)
+        let data_service = DataService::start(db.clone(), datasets, self.startup_disk_reclaim, self.spill_bound_bytes)
             .await
             .map(Arc::new)?;
 

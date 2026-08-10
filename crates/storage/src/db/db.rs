@@ -13,6 +13,7 @@ use super::{
 use crate::db::{
     ops::{perform_dataset_compaction, CompactionStatus},
     read::datasets::list_all_datasets,
+    table_id::TableId,
     write::{
         ops as cleanup_ops,
         table_builder::TableBuilder,
@@ -30,6 +31,18 @@ pub const CF_DELETED_TABLES: Name = "DELETED_TABLES";
 pub const CF_BLOCK_HASHES: Name = "BLOCK_HASHES";
 pub const CF_TRANSACTION_HASHES: Name = "TRANSACTION_HASHES";
 
+/// Every column family [`DatabaseSettings::open`] creates. Pinned by a test, because a
+/// family missing here would silently keep [`Database::flush_all`] from retiring the WAL.
+const ALL_CFS: [Name; 7] = [
+    CF_DATASETS,
+    CF_CHUNKS,
+    CF_TABLES,
+    CF_DIRTY_TABLES,
+    CF_DELETED_TABLES,
+    CF_BLOCK_HASHES,
+    CF_TRANSACTION_HASHES
+];
+
 /// Whole-file rewrite cadence for `CF_TABLES`. RocksDB leaves `periodic_compaction_seconds`
 /// disabled for leveled compaction without a compaction filter, so the effective baseline
 /// is the separate 30-day `ttl` default. 7 days buys ~4x that rewrite rate.
@@ -46,6 +59,9 @@ pub struct DatabaseSettings {
     chunk_cache_size: usize,
     data_cache_size: usize,
     with_rocksdb_stats: bool,
+    write_buffer_mb: usize,
+    max_write_buffers: i32,
+    level_base_mb: usize,
     direct_io: bool,
     cache_index_and_filter_blocks: bool,
     max_log_file_size: usize,
@@ -72,6 +88,10 @@ impl Default for DatabaseSettings {
             chunk_cache_size: 64,
             data_cache_size: 256,
             with_rocksdb_stats: false,
+            // RocksDB's own defaults; the CLI carries the deployed values
+            write_buffer_mb: 64,
+            max_write_buffers: 2,
+            level_base_mb: 256,
             direct_io: false,
             cache_index_and_filter_blocks: false,
             max_log_file_size: 10,
@@ -103,6 +123,21 @@ impl DatabaseSettings {
 
     pub fn with_direct_io(mut self, yes: bool) -> Self {
         self.direct_io = yes;
+        self
+    }
+
+    pub fn with_write_buffer_mb(mut self, mb: usize) -> Self {
+        self.write_buffer_mb = mb;
+        self
+    }
+
+    pub fn with_max_write_buffers(mut self, n: i32) -> Self {
+        self.max_write_buffers = n;
+        self
+    }
+
+    pub fn with_level_base_mb(mut self, mb: usize) -> Self {
+        self.level_base_mb = mb;
         self
     }
 
@@ -226,6 +261,14 @@ impl DatabaseSettings {
         }
         // Bound space amplification (default since RocksDB 8.4; pinned -- load-bearing here).
         options.set_level_compaction_dynamic_level_bytes(true);
+        // Scoped to this CF deliberately: it takes essentially all the write volume, so the
+        // memory cost (write_buffer_mb x max_write_buffers) is paid once rather than per CF.
+        options.set_write_buffer_size(self.write_buffer_mb << 20);
+        options.set_max_write_buffer_number(self.max_write_buffers);
+        // Sets how many levels the ladder has, and a byte is rewritten once per level.
+        // Wants to be >= level0_file_num_compaction_trigger x the compressed flush size,
+        // or L0 arrives larger than the level it merges into.
+        options.set_max_bytes_for_level_base((self.level_base_mb as u64) << 20);
         if !self.auto_compactions {
             options.set_disable_auto_compactions(true);
         }
@@ -505,6 +548,18 @@ impl Database {
         Ok(())
     }
 
+    /// Schedules `tables` for the ordinary purge. Used to abandon tables whose chunk was
+    /// refused after they were already written: their dirty marker alone is collected by the
+    /// startup orphan sweep only, so a caller refused on every retry would leak them.
+    pub fn delete_tables(&self, tables: &[TableId]) -> anyhow::Result<()> {
+        Tx::new(&self.db).run(|tx| {
+            for table_id in tables {
+                tx.delete_table(table_id)?;
+            }
+            Ok(())
+        })
+    }
+
     /// Phase 1 -- logically purge deleted tables (snapshot-safe point deletes).
     /// Returns the number of tables logically deleted by this call.
     pub fn cleanup(&self) -> anyhow::Result<usize> {
@@ -531,6 +586,21 @@ impl Database {
     /// written data is unlinkable). Bookkeeping column families are not flushed.
     pub fn flush_tables(&self) -> anyhow::Result<()> {
         self.db.flush_cf(self.db.cf_handle(CF_TABLES).unwrap())?;
+        Ok(())
+    }
+
+    /// Flush every memtable, so the next boot has almost no WAL to replay. Every family has
+    /// to go: a WAL file lives until the last one that wrote into it has flushed.
+    ///
+    /// Costs the memtables and nothing else -- unlike closing the database, which waits out
+    /// the background compactions. That is the trade at exit: pay a bounded flush here
+    /// rather than an unbounded close, and never close at all.
+    pub fn flush_all(&self) -> anyhow::Result<()> {
+        let cfs: Vec<_> = ALL_CFS
+            .iter()
+            .map(|name| self.db.cf_handle(name).expect("column family opened at startup"))
+            .collect();
+        self.db.flush_cfs_opt(&cfs, &rocksdb::FlushOptions::default())?;
         Ok(())
     }
 
@@ -679,6 +749,49 @@ mod tests {
     fn measure_hash_index_compression_disk_size() {
         measure_hash_index_compression(rocksdb::DBCompressionType::Snappy, "snappy");
         measure_hash_index_compression(rocksdb::DBCompressionType::Lz4, "lz4");
+    }
+
+    fn active_memtable_entries(db: &Database, cf_name: &str) -> u64 {
+        db.get_int_property(cf_name, "rocksdb.num-entries-active-mem-table")
+            .unwrap()
+            .unwrap()
+    }
+
+    #[test]
+    fn flush_all_empties_every_memtable() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = DatabaseSettings::default().open(dir.path()).unwrap();
+
+        for cf_name in ALL_CFS {
+            db.db.put_cf(db.db.cf_handle(cf_name).unwrap(), b"k", b"v").unwrap();
+            assert_ne!(active_memtable_entries(&db, cf_name), 0, "{cf_name} was not written");
+        }
+
+        db.flush_all().unwrap();
+
+        for cf_name in ALL_CFS {
+            assert_eq!(
+                active_memtable_entries(&db, cf_name),
+                0,
+                "{cf_name} still holds the WAL"
+            );
+        }
+    }
+
+    #[test]
+    fn all_cfs_covers_every_family_the_database_opens() {
+        let dir = tempfile::tempdir().unwrap();
+        // Dropped at once: `list_cf` needs the LOCK back.
+        DatabaseSettings::default().open(dir.path()).unwrap();
+
+        let mut opened = RocksDB::list_cf(&RocksOptions::default(), dir.path()).unwrap();
+        opened.retain(|name| name != "default");
+        opened.sort();
+
+        let mut expected: Vec<_> = ALL_CFS.iter().map(|name| name.to_string()).collect();
+        expected.sort();
+
+        assert_eq!(opened, expected);
     }
 
     #[test]

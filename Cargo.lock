@@ -4878,6 +4878,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "futures",
+ "prometheus-client 0.24.0",
  "sqd-data-client",
  "sqd-primitives",
  "tokio",
@@ -4893,6 +4894,7 @@ name = "sqd-hotblocks"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "arrow",
  "async-stream",
  "axum",
  "bytes",
@@ -4919,6 +4921,7 @@ dependencies = [
  "tempfile",
  "tikv-jemallocator",
  "tokio",
+ "tokio-util",
  "tower-http",
  "tracing",
  "tracing-subscriber",
