@@ -64,8 +64,10 @@ fn record_restart() {
     LOCAL_RESTARTS.with_borrow_mut(|val| *val = val.wrapping_add(1))
 }
 
+// Telemetry counters are independent (no cross-counter invariant), so new
+// additions use Relaxed; the pre-existing GLOBAL_RESTARTS SeqCst is kept as-is.
 fn record_exhausted() {
-    GLOBAL_EXHAUSTED.fetch_add(1, Ordering::SeqCst);
+    GLOBAL_EXHAUSTED.fetch_add(1, Ordering::Relaxed);
 }
 
 fn record_backoff(duration: Duration) {
@@ -154,6 +156,8 @@ impl RetryPolicy {
 
     /// Full-jitter backoff for `retry` (0-based retry number, i.e. attempt-1).
     fn backoff(&self, retry: u32) -> Duration {
+        // `min(16)` guards the shift: past attempt 16 the exponential term is
+        // pinned at `max_backoff` by the `min` below anyway.
         let exp = self.base_backoff.saturating_mul(1u32 << retry.min(16));
         let cap = exp.min(self.max_backoff);
         jitter(cap)
@@ -309,6 +313,10 @@ impl<'a> Tx<'a> {
     /// Runs `cb` and commits, retrying the whole run on optimistic-commit
     /// conflicts (`Busy`/`TryAgain`) under the configured [`RetryPolicy`].
     ///
+    /// Blocking: retry backoff sleeps on the calling thread. Callers on async
+    /// runtimes must route through a blocking pool (hotblocks runs these
+    /// writes on `tokio::task::spawn_blocking`).
+    ///
     /// # Callback contract
     ///
     /// `cb` may execute MORE THAN ONCE — once per attempt — and only the
@@ -369,7 +377,13 @@ impl<'a> Tx<'a> {
                         }));
                     }
                     record_restart();
-                    let sleep = policy.backoff(attempt - 1);
+                    // `tx.commit()` above consumed the failed transaction (and
+                    // its snapshot): nothing is held alive across the backoff,
+                    // which yields to the competing writer.
+                    // Full jitter, clamped to the remaining deadline so the run
+                    // never oversleeps its wall-clock budget by a full backoff.
+                    let remaining = policy.deadline.saturating_sub(started.elapsed());
+                    let sleep = policy.backoff(attempt - 1).min(remaining);
                     std::thread::sleep(sleep);
                     record_backoff(sleep);
                     if started.elapsed() >= policy.deadline {

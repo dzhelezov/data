@@ -238,7 +238,12 @@ macro_rules! warn_on_tx_restart {
         if let Err(err) = &result
             && let Some(exhausted) = err.downcast_ref::<sqd_storage::db::TxRetryExhausted>()
         {
-            tracing::error!(%exhausted, "storage transaction retry budget exhausted");
+            tracing::error!(
+                attempts = exhausted.attempts,
+                elapsed_ms = exhausted.elapsed.as_millis() as u64,
+                %exhausted,
+                "storage transaction retry budget exhausted"
+            );
         }
         result
     }};

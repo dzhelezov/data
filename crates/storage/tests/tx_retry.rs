@@ -44,6 +44,10 @@ fn dataset(db: &Database) -> sqd_storage::db::DatasetId {
     id
 }
 
+/// ORDERING IS LOAD-BEARING: the sabotage must run BEFORE the victim stages
+/// its own writes in the callback. Optimistic transactions track reads for
+/// conflict detection; the victim's label read in `DatasetUpdate::new` is what
+/// makes this competing commit conflict at the victim's commit time.
 fn sabotage(db: &Database, id: sqd_storage::db::DatasetId, marker: u64) {
     db.update_dataset(id, |tx| {
         tx.set_finalized_head(BlockRef {
@@ -163,6 +167,45 @@ fn persistent_contention_fails_with_typed_exhaustion() {
         Some(42),
         "the contested mutation never committed"
     );
+}
+
+#[test]
+fn deadline_exhausts_even_with_a_generous_attempt_budget() {
+    let _serial = serial();
+    // Generous attempt count, tight wall clock: the deadline must terminate
+    // the run, and the typed error must say so.
+    let policy = RetryPolicy::default()
+        .with_max_attempts(1000)
+        .with_deadline(Duration::from_millis(100))
+        .with_base_backoff(Duration::from_millis(30))
+        .with_max_backoff(Duration::from_millis(40));
+    let db = open_db(policy);
+    let id = dataset(&db);
+
+    let err = db
+        .update_dataset(id, |tx| {
+            sabotage(&db, id, 9); // every attempt conflicts
+            tx.set_finalized_head(BlockRef {
+                number: 42,
+                hash: "deadline-bound".to_string()
+            });
+            Ok(())
+        })
+        .unwrap_err();
+
+    let exhausted = err
+        .downcast_ref::<TxRetryExhausted>()
+        .expect("deadline exhaustion must be typed");
+    assert!(
+        exhausted.last.contains("deadline"),
+        "the deadline branch must be reported, got: {}",
+        exhausted.last
+    );
+    assert!(
+        exhausted.elapsed < Duration::from_secs(2),
+        "deadline must actually bound wall time"
+    );
+    assert_ne!(finalized_number(&db, id), Some(42));
 }
 
 #[test]
