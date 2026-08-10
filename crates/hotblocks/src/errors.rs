@@ -38,6 +38,81 @@ impl Display for QueryTaskPanicked {
 
 impl std::error::Error for QueryTaskPanicked {}
 
+/// A replay below the finalized head cannot publish a partial chunk merely to cut at a
+/// data-availability boundary.
+#[derive(Debug)]
+pub struct DataAvailabilityChangedDuringFinalizedReplay {
+    pub block_number: BlockNumber
+}
+
+impl Display for DataAvailabilityChangedDuringFinalizedReplay {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "data availability changed at block {} inside the replayed finalized range",
+            self.block_number
+        )
+    }
+}
+
+impl std::error::Error for DataAvailabilityChangedDuringFinalizedReplay {}
+
+/// Stable reason for refusing a fork or finality transition.
+///
+/// The snake-case representation is exported as the `cause` label of
+/// `dataset_epoch_failures`; dynamic details belong in the error context.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum UnapplicableForkReason {
+    HintsBelowFinalizedHead,
+    HintConflictsWithFinalizedHead,
+    BelowRetainedWindow,
+    StaleRollbackBoundary,
+    DropsFinalizedBlock,
+    RewritesFinalizedHistory,
+    FinalityHashChanged,
+    FinalityContradictsChunk,
+    FinalityEvictsFinalizedBlock,
+    FinalityContradictsStoredBlock
+}
+
+impl UnapplicableForkReason {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::HintsBelowFinalizedHead => "hints_below_finalized_head",
+            Self::HintConflictsWithFinalizedHead => "hint_conflicts_with_finalized_head",
+            Self::BelowRetainedWindow => "below_retained_window",
+            Self::StaleRollbackBoundary => "stale_rollback_boundary",
+            Self::DropsFinalizedBlock => "drops_finalized_block",
+            Self::RewritesFinalizedHistory => "rewrites_finalized_history",
+            Self::FinalityHashChanged => "finality_hash_changed",
+            Self::FinalityContradictsChunk => "finality_contradicts_chunk",
+            Self::FinalityEvictsFinalizedBlock => "finality_evicts_finalized_block",
+            Self::FinalityContradictsStoredBlock => "finality_contradicts_stored_block"
+        }
+    }
+}
+
+impl Display for UnapplicableForkReason {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// A fork or finality transition that cannot be applied safely. Kills the update task, which then
+/// parks for a minute.
+#[derive(Debug)]
+pub struct UnapplicableFork {
+    pub reason: UnapplicableForkReason
+}
+
+impl Display for UnapplicableFork {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "received fork can not be applied: {}", self.reason)
+    }
+}
+
+impl std::error::Error for UnapplicableFork {}
+
 #[derive(Debug)]
 pub struct UnknownDataset {
     pub dataset_id: DatasetId
