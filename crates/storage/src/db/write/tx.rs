@@ -25,6 +25,14 @@ use crate::db::{
 };
 
 static GLOBAL_RESTARTS: AtomicU64 = AtomicU64::new(0);
+/// Retry attempts beyond the first across all transactions (restart bookkeeping).
+static GLOBAL_RETRY_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
+/// Operations that used up their retry budget without committing.
+static GLOBAL_EXHAUSTED: AtomicU64 = AtomicU64::new(0);
+/// Aggregate time spent in retry backoff, in milliseconds.
+static GLOBAL_BACKOFF_MS: AtomicU64 = AtomicU64::new(0);
+/// Cheap xorshift64* state for backoff jitter; zero seeds itself on first use.
+static JITTER_STATE: AtomicU64 = AtomicU64::new(0);
 
 thread_local! {
     static LOCAL_RESTARTS: RefCell<u64> = RefCell::new(0);
@@ -38,10 +46,145 @@ pub fn get_local_tx_restarts() -> u64 {
     LOCAL_RESTARTS.with_borrow(|val| *val)
 }
 
+pub fn get_global_tx_retry_attempts() -> u64 {
+    GLOBAL_RETRY_ATTEMPTS.load(Ordering::Relaxed)
+}
+
+pub fn get_global_tx_exhausted() -> u64 {
+    GLOBAL_EXHAUSTED.load(Ordering::Relaxed)
+}
+
+pub fn get_global_tx_backoff_ms() -> u64 {
+    GLOBAL_BACKOFF_MS.load(Ordering::Relaxed)
+}
+
 fn record_restart() {
     GLOBAL_RESTARTS.fetch_add(1, Ordering::SeqCst);
+    GLOBAL_RETRY_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
     LOCAL_RESTARTS.with_borrow_mut(|val| *val = val.wrapping_add(1))
 }
+
+fn record_exhausted() {
+    GLOBAL_EXHAUSTED.fetch_add(1, Ordering::SeqCst);
+}
+
+fn record_backoff(duration: Duration) {
+    GLOBAL_BACKOFF_MS.fetch_add(duration.as_millis() as u64, Ordering::Relaxed);
+}
+
+/// Uniform-ish jitter in `[0, bound)` without a rand dependency: one xorshift64*
+/// step per call. Backoff sleeps are the only consumer, so correlation between
+/// successive draws is acceptable here.
+fn jitter(bound: Duration) -> Duration {
+    let mut state = JITTER_STATE.load(Ordering::Relaxed);
+    loop {
+        let next = if state == 0 {
+            // Never let the state settle at the zero fixed point.
+            0x9E3779B97F4A7C15u64
+        } else {
+            let x = state ^ (state >> 12);
+            let x = x ^ (x << 25);
+            let x = x ^ (x >> 27);
+            x.wrapping_mul(0x2545F4914F6CDD1D)
+        };
+        match JITTER_STATE.compare_exchange_weak(state, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => {
+                let bound_ms = bound.as_millis() as u64;
+                return if bound_ms == 0 {
+                    Duration::ZERO
+                } else {
+                    Duration::from_millis(next % bound_ms)
+                };
+            }
+            Err(actual) => state = actual
+        }
+    }
+}
+
+/// Bounded retry budget for optimistic storage transactions.
+///
+/// The store is designed for a single writer per dataset; `Busy`/`TryAgain`
+/// commit conflicts are expected to be rare (retention/compaction racing the
+/// ingest writer). The budget therefore exists to fail loudly when that
+/// assumption is violated, not to absorb unbounded contention: exhaustion is a
+/// typed error the caller must handle, never a silent spin.
+#[derive(Clone, Copy, Debug)]
+pub struct RetryPolicy {
+    /// Total attempts including the first. Values below 1 are clamped to 1.
+    pub max_attempts: u32,
+    /// Wall-clock budget for the whole run, counted from the first attempt.
+    pub deadline: Duration,
+    /// Base backoff before a retry; doubles each attempt up to `max_backoff`.
+    pub base_backoff: Duration,
+    /// Cap on a single backoff sleep.
+    pub max_backoff: Duration
+}
+
+impl Default for RetryPolicy {
+    fn default() -> Self {
+        Self {
+            max_attempts: 8,
+            deadline: Duration::from_secs(30),
+            base_backoff: Duration::from_millis(10),
+            max_backoff: Duration::from_secs(1)
+        }
+    }
+}
+
+impl RetryPolicy {
+    pub fn with_max_attempts(mut self, max_attempts: u32) -> Self {
+        self.max_attempts = max_attempts.max(1);
+        self
+    }
+
+    pub fn with_deadline(mut self, deadline: Duration) -> Self {
+        self.deadline = deadline;
+        self
+    }
+
+    pub fn with_base_backoff(mut self, base_backoff: Duration) -> Self {
+        self.base_backoff = base_backoff;
+        self
+    }
+
+    pub fn with_max_backoff(mut self, max_backoff: Duration) -> Self {
+        self.max_backoff = max_backoff;
+        self
+    }
+
+    /// Full-jitter backoff for `retry` (0-based retry number, i.e. attempt-1).
+    fn backoff(&self, retry: u32) -> Duration {
+        let exp = self.base_backoff.saturating_mul(1u32 << retry.min(16));
+        let cap = exp.min(self.max_backoff);
+        jitter(cap)
+    }
+}
+
+/// A transaction run gave up after exhausting its [`RetryPolicy`] without
+/// committing. No mutation became visible; the operation may be retried by the
+/// caller as a whole, but forward progress is no longer guaranteed and the
+/// single-writer assumption should be investigated.
+#[derive(Debug)]
+pub struct TxRetryExhausted {
+    pub attempts: u32,
+    pub elapsed: Duration,
+    /// Why the last commit failed (`Busy`, `TryAgain`, or deadline details).
+    pub last: String
+}
+
+impl std::fmt::Display for TxRetryExhausted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "storage transaction retry budget exhausted after {} attempts in {:.3}s: {}",
+            self.attempts,
+            self.elapsed.as_secs_f64(),
+            self.last
+        )
+    }
+}
+
+impl std::error::Error for TxRetryExhausted {}
 
 /// Dataset kinds covered by the derived hash indexes. EVM-only for now;
 /// hyperliquid must stay out because its `hash` is not a crypto hash and can
@@ -124,11 +267,16 @@ pub struct Tx<'a> {
     transaction: RocksTransaction<'a>,
     block_hash_index: bool,
     transaction_hash_index: bool,
+    retry_policy: RetryPolicy,
     hash_index_write_metrics: RefCell<HashIndexWriteMetrics>
 }
 
 impl<'a> Tx<'a> {
     pub fn new(db: &'a RocksDB) -> Self {
+        Self::with_retry_policy(db, RetryPolicy::default())
+    }
+
+    pub fn with_retry_policy(db: &'a RocksDB, retry_policy: RetryPolicy) -> Self {
         let mut tx_options = RocksTransactionOptions::default();
         tx_options.set_snapshot(true);
 
@@ -139,6 +287,7 @@ impl<'a> Tx<'a> {
             transaction,
             block_hash_index: false,
             transaction_hash_index: false,
+            retry_policy,
             hash_index_write_metrics: RefCell::new(HashIndexWriteMetrics::default())
         }
     }
@@ -157,6 +306,21 @@ impl<'a> Tx<'a> {
         self
     }
 
+    /// Runs `cb` and commits, retrying the whole run on optimistic-commit
+    /// conflicts (`Busy`/`TryAgain`) under the configured [`RetryPolicy`].
+    ///
+    /// # Callback contract
+    ///
+    /// `cb` may execute MORE THAN ONCE — once per attempt — and only the
+    /// staging of this transaction is rolled back between attempts. It MUST
+    /// therefore be deterministic and replay-safe: no logging that represents
+    /// committed state, no metric increments, no channel/watch publication,
+    /// no file or network effects before commit. Effects that depend on the
+    /// mutation having committed belong on the success path of the caller.
+    ///
+    /// On exhaustion the run fails with [`TxRetryExhausted`] (downcastable
+    /// from the `anyhow::Error`); it never spins indefinitely and never
+    /// reports success without a commit.
     pub fn run<R, F>(self, cb: F) -> anyhow::Result<R>
     where
         F: FnMut(&Self) -> anyhow::Result<R>
@@ -176,8 +340,12 @@ impl<'a> Tx<'a> {
         let db = self.db;
         let block_hash_index = self.block_hash_index;
         let transaction_hash_index = self.transaction_hash_index;
+        let policy = self.retry_policy;
+        let started = Instant::now();
         let mut tx = self;
+        let mut attempt = 0u32;
         loop {
+            attempt += 1;
             let result = match cb(&tx) {
                 Ok(result) => result,
                 Err(err) => {
@@ -190,8 +358,29 @@ impl<'a> Tx<'a> {
             match commit_result {
                 Ok(_) => return Ok(result),
                 Err(err) if err.kind() == rocksdb::ErrorKind::TryAgain || err.kind() == rocksdb::ErrorKind::Busy => {
+                    let kind = format!("{:?}", err.kind());
+                    let budget_left = attempt < policy.max_attempts && started.elapsed() < policy.deadline;
+                    if !budget_left {
+                        record_exhausted();
+                        return Err(anyhow!(TxRetryExhausted {
+                            attempts: attempt,
+                            elapsed: started.elapsed(),
+                            last: format!("commit conflict: {}", kind)
+                        }));
+                    }
                     record_restart();
-                    tx = Self::new(db)
+                    let sleep = policy.backoff(attempt - 1);
+                    std::thread::sleep(sleep);
+                    record_backoff(sleep);
+                    if started.elapsed() >= policy.deadline {
+                        record_exhausted();
+                        return Err(anyhow!(TxRetryExhausted {
+                            attempts: attempt,
+                            elapsed: started.elapsed(),
+                            last: format!("deadline after commit conflict: {}", kind)
+                        }));
+                    }
+                    tx = Self::with_retry_policy(db, policy)
                         .with_block_hash_index(block_hash_index)
                         .with_transaction_hash_index(transaction_hash_index)
                 }

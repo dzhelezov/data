@@ -17,7 +17,7 @@ use crate::db::{
     write::{
         ops as cleanup_ops,
         table_builder::TableBuilder,
-        tx::{HashIndexWriteMetrics, Tx}
+        tx::{HashIndexWriteMetrics, RetryPolicy, Tx}
     },
     Chunk, DatasetUpdate
 };
@@ -70,7 +70,8 @@ pub struct DatabaseSettings {
     max_background_jobs: usize,
     periodic_compaction_secs: u64,
     block_hash_index: bool,
-    transaction_hash_index: bool
+    transaction_hash_index: bool,
+    tx_retry_policy: RetryPolicy
 }
 
 /// RocksDB's default of 2 could not keep up with ingest during the NET-819 incident, but a
@@ -100,7 +101,8 @@ impl Default for DatabaseSettings {
             max_background_jobs: default_max_background_jobs(),
             periodic_compaction_secs: DEFAULT_PERIODIC_COMPACTION_SECS,
             block_hash_index: false,
-            transaction_hash_index: false
+            transaction_hash_index: false,
+            tx_retry_policy: RetryPolicy::default()
         }
     }
 }
@@ -193,6 +195,14 @@ impl DatabaseSettings {
     /// transaction index is commonly orders of magnitude larger.
     pub fn with_transaction_hash_index(mut self, yes: bool) -> Self {
         self.transaction_hash_index = yes;
+        self
+    }
+
+    /// Retry budget for optimistic storage transactions (directive #67:
+    /// bounded, side-effect-safe retries). The default fails fast enough to
+    /// surface single-writer violations instead of spinning on contention.
+    pub fn with_tx_retry_policy(mut self, policy: RetryPolicy) -> Self {
+        self.tx_retry_policy = policy;
         self
     }
 
@@ -348,6 +358,7 @@ impl DatabaseSettings {
             options,
             block_hash_index: self.block_hash_index,
             transaction_hash_index: self.transaction_hash_index,
+            tx_retry_policy: self.tx_retry_policy,
             lifecycle_lock: Mutex::new(())
         })
     }
@@ -358,6 +369,7 @@ pub struct Database {
     options: RocksOptions,
     block_hash_index: bool,
     transaction_hash_index: bool,
+    tx_retry_policy: RetryPolicy,
     /// Serializes only CREATE/DROP so a dataset ID cannot be reused before a
     /// prior incarnation's derived-index prefixes have been physically purged.
     lifecycle_lock: Mutex<()>
@@ -368,7 +380,7 @@ impl Database {
         let _lifecycle_guard = self.lifecycle_lock.lock();
         self.purge_stale_hash_indexes_if_dataset_absent(id)?;
 
-        Tx::new(&self.db).run(|tx| {
+        Tx::with_retry_policy(&self.db, self.tx_retry_policy).run(|tx| {
             let label = tx.find_label_for_update(id)?;
             ensure!(label.is_none(), "dataset {} already exists", id);
             tx.write_label(
@@ -386,7 +398,7 @@ impl Database {
         let _lifecycle_guard = self.lifecycle_lock.lock();
         self.purge_stale_hash_indexes_if_dataset_absent(id)?;
 
-        Tx::new(&self.db).run(|tx| {
+        Tx::with_retry_policy(&self.db, self.tx_retry_policy).run(|tx| {
             if let Some(label) = tx.find_label_for_update(id)? {
                 ensure!(
                     label.kind() == kind,
@@ -421,6 +433,11 @@ impl Database {
         self.update_dataset(dataset_id, |tx| tx.insert_fork(chunk))
     }
 
+    /// Runs a dataset mutation under the optimistic retry policy.
+    ///
+    /// `cb` may execute once per retry attempt (see [`Tx::run`]): it must be
+    /// replay-safe and must not produce externally visible side effects before
+    /// commit — publish committed state only after this call returns `Ok`.
     pub fn update_dataset<F, R>(&self, dataset_id: DatasetId, cb: F) -> anyhow::Result<R>
     where
         F: FnMut(&mut DatasetUpdate<'_>) -> anyhow::Result<R>
@@ -441,7 +458,7 @@ impl Database {
     where
         F: FnMut(&mut DatasetUpdate<'_>) -> anyhow::Result<R>
     {
-        Tx::new(&self.db)
+        Tx::with_retry_policy(&self.db, self.tx_retry_policy)
             .with_block_hash_index(self.block_hash_index)
             .with_transaction_hash_index(self.transaction_hash_index)
             .run_with_hash_index_metrics(metrics, |tx| {
@@ -470,6 +487,7 @@ impl Database {
     ) -> anyhow::Result<CompactionStatus> {
         perform_dataset_compaction(
             &self.db,
+            self.tx_retry_policy,
             dataset_id,
             max_chunk_size,
             write_amplification_limit,
@@ -483,7 +501,7 @@ impl Database {
         // Metadata is removed atomically first. Hash lookups check the label in
         // their snapshot, so the logical indexes disappear in this same commit;
         // bounded physical cleanup below cannot expose stale hits.
-        Tx::new(&self.db).run(|tx| {
+        Tx::with_retry_policy(&self.db, self.tx_retry_policy).run(|tx| {
             if tx.find_label_for_update(dataset_id)?.is_none() {
                 return Ok(());
             }
@@ -552,7 +570,7 @@ impl Database {
     /// refused after they were already written: their dirty marker alone is collected by the
     /// startup orphan sweep only, so a caller refused on every retry would leak them.
     pub fn delete_tables(&self, tables: &[TableId]) -> anyhow::Result<()> {
-        Tx::new(&self.db).run(|tx| {
+        Tx::with_retry_policy(&self.db, self.tx_retry_policy).run(|tx| {
             for table_id in tables {
                 tx.delete_table(table_id)?;
             }

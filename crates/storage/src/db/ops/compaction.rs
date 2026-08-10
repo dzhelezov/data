@@ -10,7 +10,7 @@ use crate::db::{
     db::RocksDB,
     ops::{schema_merge::can_merge_schemas, table_merge::TableMerge},
     table_id::TableId,
-    write::tx::Tx,
+    write::tx::{RetryPolicy, Tx},
     Chunk, ChunkReader, DatasetId, ReadSnapshot, TableBuilder
 };
 
@@ -34,6 +34,7 @@ pub struct MergedChunk {
 
 pub fn perform_dataset_compaction(
     db: &RocksDB,
+    retry_policy: RetryPolicy,
     dataset_id: DatasetId,
     max_chunk_size: Option<usize>,
     write_amplification_limit: Option<f64>,
@@ -41,6 +42,7 @@ pub fn perform_dataset_compaction(
 ) -> anyhow::Result<CompactionStatus> {
     DatasetCompaction {
         db,
+        retry_policy,
         snapshot: &ReadSnapshot::new(db),
         dataset_id,
         merge: Vec::new(),
@@ -53,6 +55,7 @@ pub fn perform_dataset_compaction(
 
 struct DatasetCompaction<'a> {
     db: &'a RocksDB,
+    retry_policy: RetryPolicy,
     snapshot: &'a ReadSnapshot<'a>,
     dataset_id: DatasetId,
     merge: Vec<ChunkReader<'a>>,
@@ -75,7 +78,7 @@ impl<'a> DatasetCompaction<'a> {
             self.make_chunk(tables)
         };
 
-        Tx::new(self.db).run(|tx| {
+        Tx::with_retry_policy(self.db, self.retry_policy).run(|tx| {
             let mut label = match tx.find_label_for_update(self.dataset_id)? {
                 Some(label) => label,
                 None => return Ok(CompactionStatus::Canceled)
