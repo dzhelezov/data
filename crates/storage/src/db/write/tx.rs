@@ -986,4 +986,42 @@ mod backoff_math_tests {
             "large-retry backoff should span up to max_backoff, not a lower plateau"
         );
     }
+
+    /// F67-6 (discriminating): the previous `1u32 << retry.min(16)` flattened the
+    /// exponential at `base * 2^16` for every retry past 16. With the default
+    /// policy that pin sits far *above* `max_backoff`, so it was invisible — the
+    /// cap dominated either way. The regression only shows when the exponential
+    /// would legitimately keep climbing past `2^16` before reaching the cap, i.e.
+    /// when `base * 2^16 < max_backoff`. Here the old pin caps every draw at
+    /// `base * 2^16`; the new saturating shift keeps doubling toward `max_backoff`.
+    #[test]
+    fn backoff_climbs_past_the_2_pow_16_pin_when_the_cap_allows_it() {
+        let base = Duration::from_micros(1);
+        let max = Duration::from_secs(10);
+        let policy = RetryPolicy::default().with_base_backoff(base).with_max_backoff(max);
+
+        // The old `retry.min(16)` ceiling: `base * 2^16`. Well below `max`, so a
+        // correct saturating curve must be able to exceed it at a high retry.
+        let old_pin = base * (1 << 16);
+        assert!(
+            old_pin < max,
+            "test premise: the 2^16 pin must sit below the cap to be observable"
+        );
+
+        // retry 24 wants `base * 2^24` (~16.8s), clamped to the 10s cap — so draws
+        // span [0, 10s). Under the old pin the cap would instead be `old_pin`
+        // (~65ms) and no draw could exceed it.
+        let mut saw_past_pin = false;
+        for _ in 0..1000 {
+            if policy.backoff(24) > old_pin {
+                saw_past_pin = true;
+                break;
+            }
+        }
+        assert!(
+            saw_past_pin,
+            "a high-retry backoff must be able to exceed the old base*2^16 pin \
+             ({old_pin:?}) when max_backoff ({max:?}) allows it"
+        );
+    }
 }
