@@ -376,13 +376,26 @@ impl<'a> Tx<'a> {
                 Ok(_) => return Ok(result),
                 Err(err) if err.kind() == rocksdb::ErrorKind::TryAgain || err.kind() == rocksdb::ErrorKind::Busy => {
                     let kind = format!("{:?}", err.kind());
-                    let budget_left = attempt < policy.max_attempts && started.elapsed() < policy.deadline;
+                    // Attribute the exhausting bound. The deadline can be
+                    // crossed by the callback+commit work itself (not only by a
+                    // backoff sleep), so this pre-backoff exit must report the
+                    // deadline when it is the cause — otherwise a run that a
+                    // tight wall clock terminated is mislabelled as generic
+                    // attempt exhaustion, hiding the real reason from callers.
+                    let elapsed = started.elapsed();
+                    let deadline_hit = elapsed >= policy.deadline;
+                    let budget_left = attempt < policy.max_attempts && !deadline_hit;
                     if !budget_left {
                         record_exhausted();
+                        let last = if deadline_hit {
+                            format!("deadline before backoff after commit conflict: {}", kind)
+                        } else {
+                            format!("attempt budget exhausted after commit conflict: {}", kind)
+                        };
                         return Err(anyhow!(TxRetryExhausted {
                             attempts: attempt,
-                            elapsed: started.elapsed(),
-                            last: format!("commit conflict: {}", kind)
+                            elapsed,
+                            last
                         }));
                     }
                     record_restart();
