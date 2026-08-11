@@ -8,12 +8,19 @@
 
 use std::{
     cell::Cell,
+    collections::BTreeMap,
     sync::{Arc, Mutex, MutexGuard},
     time::{Duration, Instant}
 };
 
-use sqd_primitives::BlockRef;
-use sqd_storage::db::{get_global_tx_restarts, Database, DatabaseSettings, RetryPolicy, TxRetryExhausted};
+use arrow::{
+    array::{ArrayRef, RecordBatch, StringArray, UInt32Array, UInt64Array},
+    datatypes::{DataType, Field, Schema}
+};
+use sqd_primitives::{BlockRef, TransactionRef};
+use sqd_storage::db::{
+    get_global_tx_restarts, Chunk, Database, DatabaseSettings, DatasetId, RetryPolicy, TxRetryExhausted
+};
 use tempfile::tempdir;
 
 /// The retry counters are deliberately process-global (bounded-cardinality
@@ -305,4 +312,233 @@ fn racing_writers_stay_consistent_under_contention() {
         final_head
     );
     assert_eq!(final_head.hash, format!("w{}-{}", writer, i));
+}
+
+// --- F67-5(c): indexed-write atomicity across the retry boundary -----------
+//
+// Every other sabotage test mutates only the label with both hash indexes
+// disabled, so a regression that dropped the index-write flags when the retry
+// loop recreates the transaction (`Tx::run*` re-derives them from the caller)
+// would pass unnoticed. These two tests open a database with BOTH hash indexes
+// on and insert, inside the contended callback, a chunk carrying `blocks` and
+// `transactions` tables. The label, the chunk metadata, the block-hash index
+// and the transaction-hash index must either all commit together after the
+// replays, or all be absent when the budget is exhausted — never a partial mix.
+
+fn open_indexed_db(policy: RetryPolicy) -> Database {
+    let dir = tempdir().unwrap();
+    DatabaseSettings::default()
+        .with_block_hash_index(true)
+        .with_transaction_hash_index(true)
+        .with_tx_retry_policy(policy)
+        .open(dir.path())
+        .unwrap()
+}
+
+fn indexed_block_hash(n: u64) -> String {
+    format!("0x{n:064x}")
+}
+
+fn indexed_tx_hash(block_number: u64, transaction_index: u32) -> String {
+    format!("0x7c{block_number:048x}{transaction_index:012x}")
+}
+
+/// An EVM chunk carrying both a `blocks` table (feeds `CF_BLOCK_HASHES`) and a
+/// `transactions` table (feeds `CF_TRANSACTION_HASHES`), plus the exact entries
+/// each index is expected to produce.
+struct DualIndexChunk {
+    chunk: Chunk,
+    block_hashes: Vec<(u64, String)>,
+    tx_rows: Vec<(u64, u32, String)>
+}
+
+fn make_dual_index_chunk(db: &Database, first: u64, last: u64, per_block: u32) -> DualIndexChunk {
+    // blocks table: (number, hash)
+    let block_schema = Arc::new(Schema::new(vec![
+        Field::new("number", DataType::UInt64, false),
+        Field::new("hash", DataType::Utf8, false),
+    ]));
+    let block_hashes: Vec<(u64, String)> = (first..=last).map(|n| (n, indexed_block_hash(n))).collect();
+    let block_numbers = Arc::new(UInt64Array::from(
+        block_hashes.iter().map(|(n, _)| *n).collect::<Vec<_>>()
+    )) as ArrayRef;
+    let block_hash_arr = Arc::new(StringArray::from(
+        block_hashes.iter().map(|(_, h)| h.as_str()).collect::<Vec<_>>()
+    )) as ArrayRef;
+    let mut blocks_builder = db.new_table_builder(block_schema.clone());
+    blocks_builder
+        .write_record_batch(&RecordBatch::try_new(block_schema, vec![block_numbers, block_hash_arr]).unwrap())
+        .unwrap();
+
+    // transactions table: (block_number, transaction_index, hash)
+    let tx_schema = Arc::new(Schema::new(vec![
+        Field::new("block_number", DataType::UInt64, false),
+        Field::new("transaction_index", DataType::UInt32, false),
+        Field::new("hash", DataType::Utf8, false),
+    ]));
+    let mut tx_rows: Vec<(u64, u32, String)> = Vec::new();
+    for n in first..=last {
+        for ti in 0..per_block {
+            tx_rows.push((n, ti, indexed_tx_hash(n, ti)));
+        }
+    }
+    let bn_arr = Arc::new(UInt64Array::from(
+        tx_rows.iter().map(|(b, _, _)| *b).collect::<Vec<_>>()
+    )) as ArrayRef;
+    let ti_arr = Arc::new(UInt32Array::from(
+        tx_rows.iter().map(|(_, t, _)| *t).collect::<Vec<_>>()
+    )) as ArrayRef;
+    let th_arr = Arc::new(StringArray::from(
+        tx_rows.iter().map(|(_, _, h)| h.as_str()).collect::<Vec<_>>()
+    )) as ArrayRef;
+    let mut tx_builder = db.new_table_builder(tx_schema.clone());
+    tx_builder
+        .write_record_batch(&RecordBatch::try_new(tx_schema, vec![bn_arr, ti_arr, th_arr]).unwrap())
+        .unwrap();
+
+    let mut tables = BTreeMap::new();
+    tables.insert("blocks".to_owned(), blocks_builder.finish().unwrap());
+    tables.insert("transactions".to_owned(), tx_builder.finish().unwrap());
+
+    DualIndexChunk {
+        chunk: Chunk::V1 {
+            first_block: first,
+            last_block: last,
+            last_block_hash: indexed_block_hash(last),
+            parent_block_hash: "base".to_owned(),
+            first_block_time: None,
+            last_block_time: None,
+            tables
+        },
+        block_hashes,
+        tx_rows
+    }
+}
+
+fn last_chunk_present(db: &Database, id: DatasetId) -> bool {
+    db.snapshot().get_last_chunk(id).unwrap().is_some()
+}
+
+#[test]
+fn indexed_write_commits_label_chunk_and_both_indexes_after_replays() {
+    let _serial = serial();
+    const CONFLICTS: u32 = 3;
+    let db = open_indexed_db(RetryPolicy::default().with_base_backoff(Duration::from_millis(1)));
+    let id = dataset(&db);
+    let dual = make_dual_index_chunk(&db, 0, 4, 2);
+
+    let seen_attempts = Cell::new(0u32);
+    let restarts_before = get_global_tx_restarts();
+
+    db.update_dataset(id, |tx| {
+        let attempt = seen_attempts.get();
+        seen_attempts.set(attempt + 1);
+        if attempt < CONFLICTS {
+            // Conflict on the label read, forcing the retry loop to recreate the
+            // transaction and replay this closure — index flags and all.
+            sabotage(&db, id, 700 + attempt as u64);
+        }
+        tx.insert_chunk(&dual.chunk)?;
+        tx.set_finalized_head(BlockRef {
+            number: 4,
+            hash: indexed_block_hash(4)
+        });
+        Ok(())
+    })
+    .unwrap();
+
+    assert_eq!(
+        seen_attempts.get(),
+        CONFLICTS + 1,
+        "callback replayed once per conflict"
+    );
+    assert_eq!(
+        get_global_tx_restarts() - restarts_before,
+        CONFLICTS as u64,
+        "each conflict recorded exactly one restart"
+    );
+
+    // All four artifacts of the single committed transaction are visible.
+    assert_eq!(finalized_number(&db, id), Some(4), "label finalized head committed");
+    let snapshot = db.snapshot();
+    assert!(
+        snapshot.get_last_chunk(id).unwrap().is_some(),
+        "chunk metadata committed with the label"
+    );
+    for (n, hash) in &dual.block_hashes {
+        assert_eq!(
+            snapshot.find_block_by_hash(id, hash).unwrap(),
+            Some(BlockRef {
+                number: *n,
+                hash: hash.clone()
+            }),
+            "block {n} must resolve — its hash index committed atomically with the chunk"
+        );
+    }
+    for (bn, ti, hash) in &dual.tx_rows {
+        assert_eq!(
+            snapshot.find_transaction_by_hash(id, hash).unwrap(),
+            Some(TransactionRef {
+                block_number: *bn,
+                transaction_index: *ti,
+                hash: hash.clone()
+            }),
+            "tx {hash} must resolve — its hash index committed atomically with the chunk"
+        );
+    }
+}
+
+#[test]
+fn indexed_write_leaves_no_partial_state_on_exhaustion() {
+    let _serial = serial();
+    let policy = RetryPolicy::default()
+        .with_max_attempts(3)
+        .with_base_backoff(Duration::from_millis(1))
+        .with_max_backoff(Duration::from_millis(2));
+    let db = open_indexed_db(policy);
+    let id = dataset(&db);
+    let dual = make_dual_index_chunk(&db, 0, 4, 2);
+
+    let err = db
+        .update_dataset(id, |tx| {
+            sabotage(&db, id, 7); // every attempt conflicts
+            tx.insert_chunk(&dual.chunk)?;
+            tx.set_finalized_head(BlockRef {
+                number: 4,
+                hash: indexed_block_hash(4)
+            });
+            Ok(())
+        })
+        .unwrap_err();
+
+    err.downcast_ref::<TxRetryExhausted>()
+        .expect("exhaustion must be a typed, downcastable error");
+
+    // Nothing the contended closure staged survived: not the chunk, and not a
+    // single entry in either hash index. Atomicity holds on the failure path too.
+    assert!(
+        !last_chunk_present(&db, id),
+        "no chunk may commit when the budget is exhausted"
+    );
+    let snapshot = db.snapshot();
+    for (_n, hash) in &dual.block_hashes {
+        assert_eq!(
+            snapshot.find_block_by_hash(id, hash).unwrap(),
+            None,
+            "block-hash index entry {hash} leaked despite exhaustion"
+        );
+    }
+    for (_bn, _ti, hash) in &dual.tx_rows {
+        assert_eq!(
+            snapshot.find_transaction_by_hash(id, hash).unwrap(),
+            None,
+            "transaction-hash index entry {hash} leaked despite exhaustion"
+        );
+    }
+    // The victim's label write never became visible; only the sabotage's did.
+    assert_ne!(
+        finalized_number(&db, id),
+        Some(4),
+        "the contested label never committed"
+    );
 }
