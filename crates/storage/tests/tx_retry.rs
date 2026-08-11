@@ -216,6 +216,55 @@ fn deadline_exhausts_even_with_a_generous_attempt_budget() {
 }
 
 #[test]
+fn deadline_before_backoff_is_attributed_at_the_pre_backoff_exit() {
+    let _serial = serial();
+    // F67-4: when the callback+commit work ALONE overruns the wall clock, the
+    // pre-backoff exit must attribute the DEADLINE, not generic attempt-budget
+    // exhaustion — even though the attempt budget is nowhere near spent. The
+    // sibling test above asserts only `contains("deadline")`, which passes on
+    // EITHER deadline branch (pre- or post-backoff); it does not pin the
+    // pre-backoff attribution that 1afabea added. Here a callback that sleeps
+    // well past a tiny deadline forces `deadline_hit` true on the very first
+    // commit conflict — before any backoff sleep — so the run can ONLY exit via
+    // the pre-backoff branch, and its message must say so. A regression that
+    // dropped the pre-backoff deadline check would mislabel this run "attempt
+    // budget exhausted" and this test would fail.
+    let policy = RetryPolicy::default()
+        .with_max_attempts(8) // generous: attempts are NOT the limiter here
+        .with_deadline(Duration::from_millis(5));
+    let db = open_db(policy);
+    let id = dataset(&db);
+
+    let err = db
+        .update_dataset(id, |tx| {
+            sabotage(&db, id, 11); // force the commit conflict
+                                   // Overrun the 5 ms deadline within the attempt itself,
+                                   // deterministically (60 ms ≫ 5 ms holds under CPU load too).
+            std::thread::sleep(Duration::from_millis(60));
+            tx.set_finalized_head(BlockRef {
+                number: 42,
+                hash: "pre-backoff-deadline".to_string()
+            });
+            Ok(())
+        })
+        .unwrap_err();
+
+    let exhausted = err
+        .downcast_ref::<TxRetryExhausted>()
+        .expect("deadline exhaustion must be typed");
+    assert_eq!(
+        exhausted.attempts, 1,
+        "the deadline ended the run on the first attempt, before any retry"
+    );
+    assert!(
+        exhausted.last.contains("before backoff"),
+        "the pre-backoff deadline branch must be attributed, got: {}",
+        exhausted.last
+    );
+    assert_ne!(finalized_number(&db, id), Some(42));
+}
+
+#[test]
 fn backoff_is_bounded_by_the_policy() {
     let _serial = serial();
     const CONFLICTS: u32 = 3;
