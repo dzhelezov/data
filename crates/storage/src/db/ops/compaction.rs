@@ -78,7 +78,7 @@ impl<'a> DatasetCompaction<'a> {
             self.make_chunk(tables)
         };
 
-        Tx::with_retry_policy(self.db, self.retry_policy).run(|tx| {
+        let outcome = Tx::with_retry_policy(self.db, self.retry_policy).run(|tx| {
             let mut label = match tx.find_label_for_update(self.dataset_id)? {
                 Some(label) => label,
                 None => return Ok(CompactionStatus::Canceled)
@@ -116,6 +116,42 @@ impl<'a> DatasetCompaction<'a> {
                 .collect::<anyhow::Result<_>>()?;
 
             Ok(CompactionStatus::Ok(merged_chunks))
+        });
+
+        // The merged output tables were materialized -- and dirty-marked -- before the
+        // transaction could judge the chunk. Only a committed `write_chunk` clears those
+        // markers; the orphan sweep that would otherwise reclaim them runs at startup only.
+        // So a `Canceled` (stale plan / dataset gone) or retry-exhausted outcome strands
+        // them: they keep pinning the reclaim watermark until the next restart, while
+        // hotblocks re-attempts compaction every minute and piles on more. Abandon them on
+        // any non-`Ok` outcome, mirroring `WriteController::abandon_tables` on the ingest
+        // path, so the next `logical_cleanup` reclaims them.
+        if !matches!(outcome, Ok(CompactionStatus::Ok(_))) {
+            if let Err(abandon_err) = self.abandon_new_chunk_tables(&new_chunk) {
+                // Never let a cleanup failure mask a real compaction error: the startup
+                // orphan sweep is the backstop for a missed abandon. On a clean cancel
+                // there is no primary error to preserve, so surface the abandon failure.
+                if outcome.is_ok() {
+                    return Err(abandon_err);
+                }
+            }
+        }
+
+        outcome
+    }
+
+    /// Move the merged-but-uncommitted tables to the deleted set so the next
+    /// `logical_cleanup` reclaims them and lifts the reclaim watermark. `delete_table`
+    /// stages `CF_DELETED_TABLES` entries in one bounded-retry transaction; the leftover
+    /// `CF_DIRTY_TABLES` markers are cleared by the same `purge_table` that runs during
+    /// `logical_cleanup`.
+    fn abandon_new_chunk_tables(&self, new_chunk: &Chunk) -> anyhow::Result<()> {
+        let tables: Vec<TableId> = new_chunk.tables().values().copied().collect();
+        Tx::with_retry_policy(self.db, self.retry_policy).run(|tx| {
+            for table_id in &tables {
+                tx.delete_table(table_id)?;
+            }
+            Ok(())
         })
     }
 

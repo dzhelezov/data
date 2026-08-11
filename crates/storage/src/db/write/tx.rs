@@ -398,7 +398,6 @@ impl<'a> Tx<'a> {
                             last
                         }));
                     }
-                    record_restart();
                     // `tx.commit()` above consumed the failed transaction (and
                     // its snapshot): nothing is held alive across the backoff,
                     // which yields to the competing writer.
@@ -416,6 +415,12 @@ impl<'a> Tx<'a> {
                             last: format!("deadline after commit conflict: {}", kind)
                         }));
                     }
+                    // Count the restart only now that a replacement transaction is
+                    // actually created and the callback will re-run. A run that the
+                    // post-backoff deadline check terminated above never re-ran, so
+                    // counting it earlier inflated the restart/attempt telemetry with
+                    // attempts that never happened.
+                    record_restart();
                     tx = Self::with_retry_policy(db, policy)
                         .with_block_hash_index(block_hash_index)
                         .with_transaction_hash_index(transaction_hash_index)

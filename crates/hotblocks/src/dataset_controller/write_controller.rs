@@ -518,8 +518,12 @@ impl WriteController {
 
                     // `fin` anchors the guard above and every later `compute_rollback`, and the
                     // report behind it is a header, not a block the source served (WP-8).
-                    let new_finalized_head = match finalized_head {
-                        None => current_finalized_head.clone(),
+                    // The ignore reason is RETURNED, never logged in this closure: this is the
+                    // retryable body of an optimistic transaction and re-runs on every commit
+                    // conflict, so logging here would emit one logical event once per attempt.
+                    // The committed decision is logged once, post-commit, below.
+                    let (new_finalized_head, ignored) = match finalized_head {
+                        None => (current_finalized_head.clone(), None),
                         Some(report) => {
                             match resolve_finality(
                                 tx,
@@ -528,11 +532,8 @@ impl WriteController {
                                 logical_floor,
                                 report
                             )? {
-                                FinalityDecision::Applied(new_head) => Some(new_head),
-                                FinalityDecision::Ignored(reason) => {
-                                    debug!(reason = %reason, "finalized head was ignored");
-                                    current_finalized_head.clone()
-                                }
+                                FinalityDecision::Applied(new_head) => (Some(new_head), None),
+                                FinalityDecision::Ignored(reason) => (current_finalized_head.clone(), Some(reason)),
                                 FinalityDecision::IntegrityFault { reason, detail } => {
                                     return Err(unapplicable_fork(reason, detail));
                                 }
@@ -542,20 +543,26 @@ impl WriteController {
 
                     tx.set_finalized_head(new_finalized_head.clone());
                     tx.insert_fork(chunk)?;
-                    Ok(new_finalized_head)
+                    Ok((new_finalized_head, ignored))
                 })
         });
 
         // The caller materialized these tables before we could judge the chunk, and only a
         // committed `write_chunk` clears their dirty markers — the orphan sweep runs at startup
         // only. A source refused on every retry would leak a chunk a minute.
-        let finalized_head = match commit {
-            Ok(head) => head,
+        let (finalized_head, ignored) = match commit {
+            Ok(committed) => committed,
             Err(err) => {
                 self.abandon_tables(chunk);
                 return Err(err);
             }
         };
+
+        // Logged once, after the transaction committed, so the retryable closure above stays
+        // side-effect free and a single ignored decision cannot be logged once per retry.
+        if let Some(reason) = ignored {
+            debug!(reason = %reason, "finalized head was ignored");
+        }
 
         debug!(finalized_head = valuable(&finalized_head), "saved new chunk");
 

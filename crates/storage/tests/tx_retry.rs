@@ -256,10 +256,17 @@ fn racing_writers_stay_consistent_under_contention() {
     let db = Arc::new(open_db(policy));
     let id = dataset(&db);
 
+    // Release both writers at the same instant so their transactions genuinely overlap;
+    // without the barrier one thread can finish before the other starts and the test
+    // passes on data that was never actually contended.
+    let start = Arc::new(std::sync::Barrier::new(2));
+    let restarts_before = get_global_tx_restarts();
     let mut handles = Vec::new();
     for writer in 0u64..2 {
         let db = Arc::clone(&db);
+        let start = Arc::clone(&start);
         handles.push(std::thread::spawn(move || {
+            start.wait();
             for i in 0..20u64 {
                 let number = 1000 * (writer + 1) + i;
                 db.update_dataset(id, |tx| {
@@ -276,6 +283,14 @@ fn racing_writers_stay_consistent_under_contention() {
     for h in handles {
         h.join().unwrap().unwrap();
     }
+
+    // The two writers really did collide: optimistic conflicts forced replays. Without
+    // this the "consistency under contention" claim could hold vacuously on an
+    // uncontended run.
+    assert!(
+        get_global_tx_restarts() > restarts_before,
+        "racing writers must produce at least one commit conflict / restart"
+    );
 
     // The final label must be one whole write from one writer, not a mix.
     let final_head = db
