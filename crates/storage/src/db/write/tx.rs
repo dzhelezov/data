@@ -91,11 +91,15 @@ fn jitter(bound: Duration) -> Duration {
         };
         match JITTER_STATE.compare_exchange_weak(state, next, Ordering::Relaxed, Ordering::Relaxed) {
             Ok(_) => {
-                let bound_ms = bound.as_millis() as u64;
-                return if bound_ms == 0 {
+                // Nanosecond resolution: a sub-millisecond cap must still yield
+                // a proportional sleep. `as_millis()` truncated any bound < 1ms
+                // to zero, turning a positive backoff into a zero-sleep hot spin
+                // until the attempt/deadline budget was burned.
+                let bound_ns = bound.as_nanos().min(u64::MAX as u128) as u64;
+                return if bound_ns == 0 {
                     Duration::ZERO
                 } else {
-                    Duration::from_millis(next % bound_ms)
+                    Duration::from_nanos(next % bound_ns)
                 };
             }
             Err(actual) => state = actual
@@ -156,9 +160,14 @@ impl RetryPolicy {
 
     /// Full-jitter backoff for `retry` (0-based retry number, i.e. attempt-1).
     fn backoff(&self, retry: u32) -> Duration {
-        // `min(16)` guards the shift: past attempt 16 the exponential term is
-        // pinned at `max_backoff` by the `min` below anyway.
-        let exp = self.base_backoff.saturating_mul(1u32 << retry.min(16));
+        // The exponential term doubles each retry and saturates, rather than
+        // pinning at an arbitrary 2^16 ceiling. A raw `1 << retry` panics for
+        // `retry >= 32`, so the shift is computed with `checked_shl` and
+        // saturates to `u32::MAX`; `max_backoff` is what actually caps the
+        // sleep. This keeps the documented "doubles up to max_backoff"
+        // contract instead of silently flattening the curve past attempt 16.
+        let factor = 1u32.checked_shl(retry).unwrap_or(u32::MAX);
+        let exp = self.base_backoff.saturating_mul(factor);
         let cap = exp.min(self.max_backoff);
         jitter(cap)
     }
@@ -889,4 +898,74 @@ fn encode_transaction_position(block_number: BlockNumber, transaction_index: Ite
     bytes[..8].copy_from_slice(&block_number.to_be_bytes());
     bytes[8..].copy_from_slice(&transaction_index.to_be_bytes());
     bytes
+}
+
+#[cfg(test)]
+mod backoff_math_tests {
+    use std::time::Duration;
+
+    use super::{jitter, RetryPolicy};
+
+    /// F67-2: a sub-millisecond cap must not systematically collapse to a zero
+    /// sleep. The old `as_millis()` truncation floored any bound `< 1ms` to
+    /// zero, turning a positive backoff into a zero-sleep hot spin that burned
+    /// the whole retry budget instantly. Nanosecond resolution yields
+    /// proportional, positive draws.
+    #[test]
+    fn subms_jitter_bound_is_not_floored_to_zero() {
+        let bound = Duration::from_micros(500);
+        let mut saw_positive = false;
+        for _ in 0..1000 {
+            let d = jitter(bound);
+            assert!(d < bound, "draw {d:?} must stay inside [0, {bound:?})");
+            if d > Duration::ZERO {
+                saw_positive = true;
+            }
+        }
+        assert!(
+            saw_positive,
+            "a positive sub-ms cap must produce positive backoff draws"
+        );
+    }
+
+    #[test]
+    fn zero_bound_jitter_is_zero() {
+        assert_eq!(jitter(Duration::ZERO), Duration::ZERO);
+    }
+
+    /// F67-6: retry numbers past 16 — and past the u32 shift width — must not
+    /// panic (a raw `1u32 << retry` overflows for `retry >= 32`) and must stay
+    /// capped by `max_backoff`, rather than the old arbitrary 2^16 pin.
+    #[test]
+    fn backoff_saturates_past_the_shift_width_without_panicking() {
+        let policy = RetryPolicy::default(); // base 10ms, max 1s
+        for retry in [0u32, 15, 16, 31, 32, 33, 64, 200] {
+            let d = policy.backoff(retry);
+            assert!(
+                d <= policy.max_backoff,
+                "retry {retry}: {d:?} must be capped by max_backoff {:?}",
+                policy.max_backoff
+            );
+        }
+    }
+
+    /// The exponential actually climbs to the `max_backoff` cap instead of a
+    /// smaller flattened plateau: sampled large-retry draws reach the upper
+    /// half of the window.
+    #[test]
+    fn backoff_reaches_the_max_backoff_cap() {
+        let policy = RetryPolicy::default();
+        let half = policy.max_backoff / 2;
+        let mut saw_high = false;
+        for _ in 0..1000 {
+            if policy.backoff(20) >= half {
+                saw_high = true;
+                break;
+            }
+        }
+        assert!(
+            saw_high,
+            "large-retry backoff should span up to max_backoff, not a lower plateau"
+        );
+    }
 }
