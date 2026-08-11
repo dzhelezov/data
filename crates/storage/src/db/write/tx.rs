@@ -25,6 +25,14 @@ use crate::db::{
 };
 
 static GLOBAL_RESTARTS: AtomicU64 = AtomicU64::new(0);
+/// Retry attempts beyond the first across all transactions (restart bookkeeping).
+static GLOBAL_RETRY_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
+/// Operations that used up their retry budget without committing.
+static GLOBAL_EXHAUSTED: AtomicU64 = AtomicU64::new(0);
+/// Aggregate time spent in retry backoff, in milliseconds.
+static GLOBAL_BACKOFF_MS: AtomicU64 = AtomicU64::new(0);
+/// Cheap xorshift64* state for backoff jitter; zero seeds itself on first use.
+static JITTER_STATE: AtomicU64 = AtomicU64::new(0);
 
 thread_local! {
     static LOCAL_RESTARTS: RefCell<u64> = RefCell::new(0);
@@ -38,10 +46,158 @@ pub fn get_local_tx_restarts() -> u64 {
     LOCAL_RESTARTS.with_borrow(|val| *val)
 }
 
+pub fn get_global_tx_retry_attempts() -> u64 {
+    GLOBAL_RETRY_ATTEMPTS.load(Ordering::Relaxed)
+}
+
+pub fn get_global_tx_exhausted() -> u64 {
+    GLOBAL_EXHAUSTED.load(Ordering::Relaxed)
+}
+
+pub fn get_global_tx_backoff_ms() -> u64 {
+    GLOBAL_BACKOFF_MS.load(Ordering::Relaxed)
+}
+
 fn record_restart() {
     GLOBAL_RESTARTS.fetch_add(1, Ordering::SeqCst);
+    GLOBAL_RETRY_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
     LOCAL_RESTARTS.with_borrow_mut(|val| *val = val.wrapping_add(1))
 }
+
+// Telemetry counters are independent (no cross-counter invariant), so new
+// additions use Relaxed; the pre-existing GLOBAL_RESTARTS SeqCst is kept as-is.
+fn record_exhausted() {
+    GLOBAL_EXHAUSTED.fetch_add(1, Ordering::Relaxed);
+}
+
+fn record_backoff(duration: Duration) {
+    GLOBAL_BACKOFF_MS.fetch_add(duration.as_millis() as u64, Ordering::Relaxed);
+}
+
+/// Uniform-ish jitter in `[0, bound)` without a rand dependency: one xorshift64*
+/// step per call. Backoff sleeps are the only consumer, so correlation between
+/// successive draws is acceptable here.
+fn jitter(bound: Duration) -> Duration {
+    let mut state = JITTER_STATE.load(Ordering::Relaxed);
+    loop {
+        let next = if state == 0 {
+            // Never let the state settle at the zero fixed point.
+            0x9E3779B97F4A7C15u64
+        } else {
+            let x = state ^ (state >> 12);
+            let x = x ^ (x << 25);
+            let x = x ^ (x >> 27);
+            x.wrapping_mul(0x2545F4914F6CDD1D)
+        };
+        match JITTER_STATE.compare_exchange_weak(state, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => {
+                // Nanosecond resolution: a sub-millisecond cap must still yield
+                // a proportional sleep. `as_millis()` truncated any bound < 1ms
+                // to zero, turning a positive backoff into a zero-sleep hot spin
+                // until the attempt/deadline budget was burned.
+                let bound_ns = bound.as_nanos().min(u64::MAX as u128) as u64;
+                return if bound_ns == 0 {
+                    Duration::ZERO
+                } else {
+                    Duration::from_nanos(next % bound_ns)
+                };
+            }
+            Err(actual) => state = actual
+        }
+    }
+}
+
+/// Bounded retry budget for optimistic storage transactions.
+///
+/// The store is designed for a single writer per dataset; `Busy`/`TryAgain`
+/// commit conflicts are expected to be rare (retention/compaction racing the
+/// ingest writer). The budget therefore exists to fail loudly when that
+/// assumption is violated, not to absorb unbounded contention: exhaustion is a
+/// typed error the caller must handle, never a silent spin.
+#[derive(Clone, Copy, Debug)]
+pub struct RetryPolicy {
+    /// Total attempts including the first. Values below 1 are clamped to 1.
+    pub max_attempts: u32,
+    /// Wall-clock budget for the whole run, counted from the first attempt.
+    pub deadline: Duration,
+    /// Base backoff before a retry; doubles each attempt up to `max_backoff`.
+    pub base_backoff: Duration,
+    /// Cap on a single backoff sleep.
+    pub max_backoff: Duration
+}
+
+impl Default for RetryPolicy {
+    fn default() -> Self {
+        Self {
+            max_attempts: 8,
+            deadline: Duration::from_secs(30),
+            base_backoff: Duration::from_millis(10),
+            max_backoff: Duration::from_secs(1)
+        }
+    }
+}
+
+impl RetryPolicy {
+    pub fn with_max_attempts(mut self, max_attempts: u32) -> Self {
+        self.max_attempts = max_attempts.max(1);
+        self
+    }
+
+    pub fn with_deadline(mut self, deadline: Duration) -> Self {
+        self.deadline = deadline;
+        self
+    }
+
+    pub fn with_base_backoff(mut self, base_backoff: Duration) -> Self {
+        self.base_backoff = base_backoff;
+        self
+    }
+
+    pub fn with_max_backoff(mut self, max_backoff: Duration) -> Self {
+        self.max_backoff = max_backoff;
+        self
+    }
+
+    /// Full-jitter backoff for `retry` (0-based retry number, i.e. attempt-1).
+    fn backoff(&self, retry: u32) -> Duration {
+        // The exponential term doubles each retry and saturates, rather than
+        // pinning at an arbitrary 2^16 ceiling. A raw `1 << retry` panics for
+        // `retry >= 32`, so the shift is computed with `checked_shl` and
+        // saturates to `u32::MAX`; `max_backoff` is what actually caps the
+        // sleep. This keeps the documented "doubles up to max_backoff"
+        // contract instead of silently flattening the curve past attempt 16.
+        let factor = 1u32.checked_shl(retry).unwrap_or(u32::MAX);
+        let exp = self.base_backoff.saturating_mul(factor);
+        let cap = exp.min(self.max_backoff);
+        jitter(cap)
+    }
+}
+
+/// A transaction run gave up after exhausting its [`RetryPolicy`] without
+/// committing. No mutation became visible; the operation may be retried by the
+/// caller as a whole, but forward progress is no longer guaranteed and the
+/// single-writer assumption should be investigated.
+#[derive(Debug)]
+pub struct TxRetryExhausted {
+    pub attempts: u32,
+    pub elapsed: Duration,
+    /// Why the last commit failed (`Busy`, `TryAgain`, or deadline details).
+    pub last: String
+}
+
+impl std::fmt::Display for TxRetryExhausted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "storage transaction retry budget exhausted after {} attempts in {:.3}s: {}",
+            self.attempts,
+            self.elapsed.as_secs_f64(),
+            self.last
+        )
+    }
+}
+
+impl std::error::Error for TxRetryExhausted {}
 
 /// Dataset kinds covered by the derived hash indexes. EVM-only for now;
 /// hyperliquid must stay out because its `hash` is not a crypto hash and can
@@ -124,11 +280,16 @@ pub struct Tx<'a> {
     transaction: RocksTransaction<'a>,
     block_hash_index: bool,
     transaction_hash_index: bool,
+    retry_policy: RetryPolicy,
     hash_index_write_metrics: RefCell<HashIndexWriteMetrics>
 }
 
 impl<'a> Tx<'a> {
     pub fn new(db: &'a RocksDB) -> Self {
+        Self::with_retry_policy(db, RetryPolicy::default())
+    }
+
+    pub fn with_retry_policy(db: &'a RocksDB, retry_policy: RetryPolicy) -> Self {
         let mut tx_options = RocksTransactionOptions::default();
         tx_options.set_snapshot(true);
 
@@ -139,6 +300,7 @@ impl<'a> Tx<'a> {
             transaction,
             block_hash_index: false,
             transaction_hash_index: false,
+            retry_policy,
             hash_index_write_metrics: RefCell::new(HashIndexWriteMetrics::default())
         }
     }
@@ -157,6 +319,25 @@ impl<'a> Tx<'a> {
         self
     }
 
+    /// Runs `cb` and commits, retrying the whole run on optimistic-commit
+    /// conflicts (`Busy`/`TryAgain`) under the configured [`RetryPolicy`].
+    ///
+    /// Blocking: retry backoff sleeps on the calling thread. Callers on async
+    /// runtimes must route through a blocking pool (hotblocks runs these
+    /// writes on `tokio::task::spawn_blocking`).
+    ///
+    /// # Callback contract
+    ///
+    /// `cb` may execute MORE THAN ONCE — once per attempt — and only the
+    /// staging of this transaction is rolled back between attempts. It MUST
+    /// therefore be deterministic and replay-safe: no logging that represents
+    /// committed state, no metric increments, no channel/watch publication,
+    /// no file or network effects before commit. Effects that depend on the
+    /// mutation having committed belong on the success path of the caller.
+    ///
+    /// On exhaustion the run fails with [`TxRetryExhausted`] (downcastable
+    /// from the `anyhow::Error`); it never spins indefinitely and never
+    /// reports success without a commit.
     pub fn run<R, F>(self, cb: F) -> anyhow::Result<R>
     where
         F: FnMut(&Self) -> anyhow::Result<R>
@@ -176,8 +357,12 @@ impl<'a> Tx<'a> {
         let db = self.db;
         let block_hash_index = self.block_hash_index;
         let transaction_hash_index = self.transaction_hash_index;
+        let policy = self.retry_policy;
+        let started = Instant::now();
         let mut tx = self;
+        let mut attempt = 0u32;
         loop {
+            attempt += 1;
             let result = match cb(&tx) {
                 Ok(result) => result,
                 Err(err) => {
@@ -190,8 +375,53 @@ impl<'a> Tx<'a> {
             match commit_result {
                 Ok(_) => return Ok(result),
                 Err(err) if err.kind() == rocksdb::ErrorKind::TryAgain || err.kind() == rocksdb::ErrorKind::Busy => {
+                    let kind = format!("{:?}", err.kind());
+                    // Attribute the exhausting bound. The deadline can be
+                    // crossed by the callback+commit work itself (not only by a
+                    // backoff sleep), so this pre-backoff exit must report the
+                    // deadline when it is the cause — otherwise a run that a
+                    // tight wall clock terminated is mislabelled as generic
+                    // attempt exhaustion, hiding the real reason from callers.
+                    let elapsed = started.elapsed();
+                    let deadline_hit = elapsed >= policy.deadline;
+                    let budget_left = attempt < policy.max_attempts && !deadline_hit;
+                    if !budget_left {
+                        record_exhausted();
+                        let last = if deadline_hit {
+                            format!("deadline before backoff after commit conflict: {}", kind)
+                        } else {
+                            format!("attempt budget exhausted after commit conflict: {}", kind)
+                        };
+                        return Err(anyhow!(TxRetryExhausted {
+                            attempts: attempt,
+                            elapsed,
+                            last
+                        }));
+                    }
+                    // `tx.commit()` above consumed the failed transaction (and
+                    // its snapshot): nothing is held alive across the backoff,
+                    // which yields to the competing writer.
+                    // Full jitter, clamped to the remaining deadline so the run
+                    // never oversleeps its wall-clock budget by a full backoff.
+                    let remaining = policy.deadline.saturating_sub(started.elapsed());
+                    let sleep = policy.backoff(attempt - 1).min(remaining);
+                    std::thread::sleep(sleep);
+                    record_backoff(sleep);
+                    if started.elapsed() >= policy.deadline {
+                        record_exhausted();
+                        return Err(anyhow!(TxRetryExhausted {
+                            attempts: attempt,
+                            elapsed: started.elapsed(),
+                            last: format!("deadline after commit conflict: {}", kind)
+                        }));
+                    }
+                    // Count the restart only now that a replacement transaction is
+                    // actually created and the callback will re-run. A run that the
+                    // post-backoff deadline check terminated above never re-ran, so
+                    // counting it earlier inflated the restart/attempt telemetry with
+                    // attempts that never happened.
                     record_restart();
-                    tx = Self::new(db)
+                    tx = Self::with_retry_policy(db, policy)
                         .with_block_hash_index(block_hash_index)
                         .with_transaction_hash_index(transaction_hash_index)
                 }
@@ -686,4 +916,112 @@ fn encode_transaction_position(block_number: BlockNumber, transaction_index: Ite
     bytes[..8].copy_from_slice(&block_number.to_be_bytes());
     bytes[8..].copy_from_slice(&transaction_index.to_be_bytes());
     bytes
+}
+
+#[cfg(test)]
+mod backoff_math_tests {
+    use std::time::Duration;
+
+    use super::{jitter, RetryPolicy};
+
+    /// F67-2: a sub-millisecond cap must not systematically collapse to a zero
+    /// sleep. The old `as_millis()` truncation floored any bound `< 1ms` to
+    /// zero, turning a positive backoff into a zero-sleep hot spin that burned
+    /// the whole retry budget instantly. Nanosecond resolution yields
+    /// proportional, positive draws.
+    #[test]
+    fn subms_jitter_bound_is_not_floored_to_zero() {
+        let bound = Duration::from_micros(500);
+        let mut saw_positive = false;
+        for _ in 0..1000 {
+            let d = jitter(bound);
+            assert!(d < bound, "draw {d:?} must stay inside [0, {bound:?})");
+            if d > Duration::ZERO {
+                saw_positive = true;
+            }
+        }
+        assert!(
+            saw_positive,
+            "a positive sub-ms cap must produce positive backoff draws"
+        );
+    }
+
+    #[test]
+    fn zero_bound_jitter_is_zero() {
+        assert_eq!(jitter(Duration::ZERO), Duration::ZERO);
+    }
+
+    /// F67-6: retry numbers past 16 — and past the u32 shift width — must not
+    /// panic (a raw `1u32 << retry` overflows for `retry >= 32`) and must stay
+    /// capped by `max_backoff`, rather than the old arbitrary 2^16 pin.
+    #[test]
+    fn backoff_saturates_past_the_shift_width_without_panicking() {
+        let policy = RetryPolicy::default(); // base 10ms, max 1s
+        for retry in [0u32, 15, 16, 31, 32, 33, 64, 200] {
+            let d = policy.backoff(retry);
+            assert!(
+                d <= policy.max_backoff,
+                "retry {retry}: {d:?} must be capped by max_backoff {:?}",
+                policy.max_backoff
+            );
+        }
+    }
+
+    /// The exponential actually climbs to the `max_backoff` cap instead of a
+    /// smaller flattened plateau: sampled large-retry draws reach the upper
+    /// half of the window.
+    #[test]
+    fn backoff_reaches_the_max_backoff_cap() {
+        let policy = RetryPolicy::default();
+        let half = policy.max_backoff / 2;
+        let mut saw_high = false;
+        for _ in 0..1000 {
+            if policy.backoff(20) >= half {
+                saw_high = true;
+                break;
+            }
+        }
+        assert!(
+            saw_high,
+            "large-retry backoff should span up to max_backoff, not a lower plateau"
+        );
+    }
+
+    /// F67-6 (discriminating): the previous `1u32 << retry.min(16)` flattened the
+    /// exponential at `base * 2^16` for every retry past 16. With the default
+    /// policy that pin sits far *above* `max_backoff`, so it was invisible — the
+    /// cap dominated either way. The regression only shows when the exponential
+    /// would legitimately keep climbing past `2^16` before reaching the cap, i.e.
+    /// when `base * 2^16 < max_backoff`. Here the old pin caps every draw at
+    /// `base * 2^16`; the new saturating shift keeps doubling toward `max_backoff`.
+    #[test]
+    fn backoff_climbs_past_the_2_pow_16_pin_when_the_cap_allows_it() {
+        let base = Duration::from_micros(1);
+        let max = Duration::from_secs(10);
+        let policy = RetryPolicy::default().with_base_backoff(base).with_max_backoff(max);
+
+        // The old `retry.min(16)` ceiling: `base * 2^16`. Well below `max`, so a
+        // correct saturating curve must be able to exceed it at a high retry.
+        let old_pin = base * (1 << 16);
+        assert!(
+            old_pin < max,
+            "test premise: the 2^16 pin must sit below the cap to be observable"
+        );
+
+        // retry 24 wants `base * 2^24` (~16.8s), clamped to the 10s cap — so draws
+        // span [0, 10s). Under the old pin the cap would instead be `old_pin`
+        // (~65ms) and no draw could exceed it.
+        let mut saw_past_pin = false;
+        for _ in 0..1000 {
+            if policy.backoff(24) > old_pin {
+                saw_past_pin = true;
+                break;
+            }
+        }
+        assert!(
+            saw_past_pin,
+            "a high-retry backoff must be able to exceed the old base*2^16 pin \
+             ({old_pin:?}) when max_backoff ({max:?}) allows it"
+        );
+    }
 }

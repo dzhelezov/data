@@ -334,3 +334,70 @@ fn compaction_plan_test_execution(
         }
     }
 }
+
+/// F67-3: a compaction that does not commit its merged chunk must not strand the tables
+/// it already materialized.
+///
+/// Two compactions racing the same dataset -- exactly what hotblocks does when it
+/// re-attempts compaction every minute -- overlap: the one that commits second sees the
+/// chunks already merged (`data_was_changed`) and returns `Canceled`. Its merged output
+/// table was materialized and dirty-marked before that verdict, so without the abandon it
+/// leaks -- an orphan `DIRTY_TABLES` marker pinning the reclaim watermark until the next
+/// restart, one per lost race. This proves the loser hands those tables to logical cleanup.
+#[test]
+fn canceled_compaction_abandons_its_merged_tables() {
+    let (db, dataset_id) = setup_db();
+    let db = Arc::new(db);
+
+    let schema = make_schema(DataType::UInt32, DataType::UInt32, false);
+    let static_data = vec![(0..300u16).collect::<Vec<_>>(), (0..300u16).collect::<Vec<_>>()];
+    for i in 0..30 {
+        let (chunk, _) = make_block(&static_data, i, Arc::clone(&schema), &db);
+        db.insert_chunk(dataset_id, &chunk).unwrap();
+    }
+
+    let mut saw_cancel = false;
+    for _ in 0..60 {
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let handles: Vec<_> = (0..2)
+            .map(|_| {
+                let db = Arc::clone(&db);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    // Released together so the two runs genuinely overlap.
+                    barrier.wait();
+                    db.perform_dataset_compaction(dataset_id, Some(100), Some(1.25), None)
+                })
+            })
+            .collect();
+        let outcomes: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        if outcomes
+            .iter()
+            .any(|o| matches!(o, Ok(CompactionStatus::Canceled) | Err(_)))
+        {
+            saw_cancel = true;
+            break;
+        }
+        if outcomes
+            .iter()
+            .all(|o| matches!(o, Ok(CompactionStatus::NotingToCompact)))
+        {
+            break; // nothing left to merge -- the races never overlapped
+        }
+    }
+    assert!(
+        saw_cancel,
+        "a racing compaction must be canceled (its merged tables would otherwise strand)"
+    );
+
+    // The canceled run moved its merged tables to the deleted set, so logical cleanup
+    // point-deletes them and clears their dirty markers -- no orphan survives to pin the
+    // reclaim watermark. Without the F67-3 abandon the stranded tables stay dirty and this
+    // count is non-zero.
+    db.cleanup().unwrap();
+    assert_eq!(
+        db.purge_orphan_dirty_tables().unwrap(),
+        0,
+        "a canceled compaction must abandon its merged tables -- no orphan dirty markers"
+    );
+}

@@ -232,6 +232,19 @@ macro_rules! warn_on_tx_restart {
         if restarts > 1 {
             warn!("storage transaction restarted {} times", restarts);
         }
+        // Retry-budget exhaustion means the single-writer assumption is under
+        // pressure: forward progress is no longer guaranteed, so this is an
+        // error, not a restart warning.
+        if let Err(err) = &result
+            && let Some(exhausted) = err.downcast_ref::<sqd_storage::db::TxRetryExhausted>()
+        {
+            tracing::error!(
+                attempts = exhausted.attempts,
+                elapsed_ms = exhausted.elapsed.as_millis() as u64,
+                %exhausted,
+                "storage transaction retry budget exhausted"
+            );
+        }
         result
     }};
 }
