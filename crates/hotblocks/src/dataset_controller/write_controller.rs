@@ -9,7 +9,9 @@ use tracing::{debug, field::valuable, info, instrument, warn};
 use crate::{
     dataset_controller::ingest_generic::{IngestMessage, NewChunk},
     errors::{UnapplicableFork, UnapplicableForkReason as ForkReason},
-    metrics::{WriteStage, report_hash_index_write_metrics, report_write_duration},
+    metrics::{
+        RetentionResetCause, WriteStage, report_hash_index_write_metrics, report_retention_reset, report_write_duration
+    },
     types::{DBRef, DatasetKind}
 };
 
@@ -331,11 +333,13 @@ impl WriteController {
             }
             Status::HashMismatch => {
                 self.clear_heads();
+                report_retention_reset(self.dataset_id, RetentionResetCause::HashMismatch);
                 warn!("cleared dataset due to parent block hash mismatch");
                 false
             }
             Status::Gap(existed) => {
                 self.clear_heads();
+                report_retention_reset(self.dataset_id, RetentionResetCause::Gap);
                 warn!(
                     "cleared dataset, because there was a gap between first requested block {} and already existed {}",
                     from_block, existed
@@ -343,6 +347,12 @@ impl WriteController {
                 false
             }
             Status::Clear => {
+                // Reached both when the window was already empty (benign) and when the floor
+                // advanced above every stored chunk, deleting a live window. Only the latter is a
+                // reset: a present head is proof a populated window was just destroyed.
+                if self.head.is_some() {
+                    report_retention_reset(self.dataset_id, RetentionResetCause::Cleared);
+                }
                 self.clear_heads();
                 info!("dataset was cleared");
                 false
@@ -951,9 +961,15 @@ mod tests {
     }
 
     fn fixture() -> Fixture {
+        fixture_with_id("evm-test")
+    }
+
+    // A per-test dataset id keeps tests that assert on the process-global metric families (e.g.
+    // `retention_resets`) from colliding with each other under the default parallel test runner.
+    fn fixture_with_id(dataset_id: &str) -> Fixture {
         let dir = tempfile::tempdir().unwrap();
         let db: DBRef = Arc::new(DatabaseSettings::default().open(dir.path()).unwrap());
-        let dataset_id = DatasetId::from_str("evm-test");
+        let dataset_id = DatasetId::from_str(dataset_id);
         let (head_tx, head_rx) = watch::channel(None);
         let (fin_tx, fin_rx) = watch::channel(None);
         let wc = WriteController::new(db.clone(), dataset_id, DatasetKind::Evm, head_tx, fin_tx).unwrap();
@@ -1595,6 +1611,72 @@ mod tests {
             "a parent hash mismatch inside the window clears it"
         );
         assert_eq!(f.wc.head(), None);
+        Ok(())
+    }
+
+    // The counter behind the reset alert must move exactly when a live window is torn down and stay
+    // still when `Status::Clear` fires on an already-empty window — the head-guard's whole reason to
+    // exist. `retain_reports_a_cleared_window` proves the return value; this proves the metric, which
+    // is what the alert and the operator actually see. Reads the same global family the runtime feeds,
+    // per unique dataset id so the process-global counter is not shared with other tests.
+    #[test]
+    fn retention_reset_counter_moves_only_when_a_window_is_destroyed() -> anyhow::Result<()> {
+        use crate::metrics::{RetentionResetCause, retention_reset_count};
+
+        // An already-empty clear (floor over an empty window) must not register a reset.
+        let mut f = fixture_with_id("retention-reset-empty-clear");
+        let before = retention_reset_count(f.dataset_id, RetentionResetCause::Cleared);
+        assert!(
+            !f.wc.retain(200, None)?,
+            "a floor over an empty window strands a would-be ingest"
+        );
+        assert_eq!(
+            retention_reset_count(f.dataset_id, RetentionResetCause::Cleared),
+            before,
+            "an already-empty clear must stay silent"
+        );
+
+        // A populated window destroyed by a floor above every chunk: exactly one `cleared` reset.
+        let mut f = fixture_with_id("retention-reset-destroy-clear");
+        seed_chain(&mut f)?;
+        let before = retention_reset_count(f.dataset_id, RetentionResetCause::Cleared);
+        assert!(!f.wc.retain(100, None)?, "a floor above the head clears the window");
+        assert_eq!(
+            retention_reset_count(f.dataset_id, RetentionResetCause::Cleared),
+            before + 1,
+            "destroying a populated window must count exactly one cleared reset"
+        );
+
+        // A populated window destroyed by a parent-hash mismatch: exactly one `hash_mismatch` reset.
+        let mut f = fixture_with_id("retention-reset-hash-mismatch");
+        seed_chain(&mut f)?;
+        let before = retention_reset_count(f.dataset_id, RetentionResetCause::HashMismatch);
+        assert!(
+            !f.wc.retain(7, Some("fork-6".to_string()))?,
+            "a parent hash mismatch inside the window clears it"
+        );
+        assert_eq!(
+            retention_reset_count(f.dataset_id, RetentionResetCause::HashMismatch),
+            before + 1,
+            "a hash-mismatch teardown must count exactly one hash_mismatch reset"
+        );
+
+        // A populated window whose only chunk starts above the requested floor, with an uncoverable
+        // gap below it: exactly one `gap` reset. A single chunk `[4..6]` retained from block 2 hits
+        // the gap branch directly — no multi-chunk hole needed.
+        let mut f = fixture_with_id("retention-reset-gap");
+        f.wc.new_chunk(None, &linked_chunk(&f.db, 4, 6, "genesis", "gap")?)?;
+        let before = retention_reset_count(f.dataset_id, RetentionResetCause::Gap);
+        assert!(
+            !f.wc.retain(2, None)?,
+            "a floor below a window that starts above it, with a gap between, clears it"
+        );
+        assert_eq!(
+            retention_reset_count(f.dataset_id, RetentionResetCause::Gap),
+            before + 1,
+            "a gap teardown must count exactly one gap reset"
+        );
+
         Ok(())
     }
 

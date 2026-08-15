@@ -213,6 +213,73 @@ pub(crate) fn report_dataset_epoch_failure(dataset_id: DatasetId, err: &anyhow::
         .inc();
 }
 
+/// Why a retention call tore the whole hot window down instead of trimming it — every increment
+/// means a live ingest lost the head it was building on and must restart from the new floor.
+/// `HashMismatch` and `Gap` are reached only through [`WriteController::retain`] (the
+/// `delete_mismatch = true` path); the `init_retention` path refuses those two with an error
+/// instead. `Cleared` is reachable from either path and is counted only when a populated window
+/// actually existed, so a fresh or already-empty dataset does not register a reset.
+#[derive(Copy, Clone, Hash, Debug, Eq, PartialEq)]
+pub(crate) enum RetentionResetCause {
+    /// A stored chunk's parent-block hash did not match the requested anchor — a reorg reaching
+    /// below the hot window.
+    HashMismatch,
+    /// The requested floor sat above the stored chunks with an uncoverable gap between them.
+    Gap,
+    /// The requested floor advanced above every stored chunk, so the whole populated window was
+    /// deleted rather than trimmed.
+    Cleared
+}
+
+impl RetentionResetCause {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::HashMismatch => "hash_mismatch",
+            Self::Gap => "gap",
+            Self::Cleared => "cleared"
+        }
+    }
+}
+
+impl EncodeLabelValue for RetentionResetCause {
+    fn encode(&self, encoder: &mut LabelValueEncoder) -> Result<(), std::fmt::Error> {
+        encoder.write_str(self.as_str())
+    }
+}
+
+#[derive(Copy, Clone, Hash, Debug, Eq, PartialEq, EncodeLabelSet)]
+struct RetentionResetLabels {
+    dataset: DatasetValue,
+    cause: RetentionResetCause
+}
+
+static RETENTION_RESETS: LazyLock<Family<RetentionResetLabels, Counter>> = LazyLock::new(Default::default);
+
+/// Count a destructive retention reset. Never labelled by message: `cause` is a closed enum, never
+/// the block number or hash that triggered the reset.
+pub(crate) fn report_retention_reset(dataset_id: DatasetId, cause: RetentionResetCause) {
+    RETENTION_RESETS
+        .get_or_create(&RetentionResetLabels {
+            dataset: DatasetValue(dataset_id),
+            cause
+        })
+        .inc();
+}
+
+/// The live value of the `retention_resets` counter for one dataset+cause. Lets a controller test
+/// assert the head-guard's behaviour — that a destructive retention reset increments and an
+/// already-empty clear stays silent — against the same global family the runtime feeds, rather than
+/// re-deriving it. Reading `get_or_create`s a zero series for an untouched pair, which is harmless.
+#[cfg(test)]
+pub(crate) fn retention_reset_count(dataset_id: DatasetId, cause: RetentionResetCause) -> u64 {
+    RETENTION_RESETS
+        .get_or_create(&RetentionResetLabels {
+            dataset: DatasetValue(dataset_id),
+            cause
+        })
+        .get()
+}
+
 static WRITE_DURATION: LazyLock<Family<WriteLabels, Histogram>> =
     LazyLock::new(|| Family::new_with_constructor(|| Histogram::new(buckets(0.0001, 28))));
 
@@ -767,6 +834,17 @@ pub fn build_metrics_registry() -> Registry {
         DATASET_EPOCH_FAILURES.clone()
     );
 
+    registry.register(
+        "retention_resets",
+        "Retention calls that destroyed a populated hot window instead of trimming it, by dataset \
+         and cause. cause=hash_mismatch is a reorg below the hot window (a stored chunk's \
+         parent-hash did not match the requested anchor); cause=gap is an uncoverable gap above \
+         the stored chunks; cause=cleared is the floor advancing above the whole window. Each \
+         increment is a silent full-window rebuild -- a live ingest loses the head it was \
+         building on and must restart from the new floor",
+        RETENTION_RESETS.clone()
+    );
+
     registry.register("http_status", "Number of sent HTTP responses", HTTP_STATUS.clone());
     registry.register(
         "http_seconds_to_first_byte",
@@ -974,6 +1052,55 @@ mod tests {
         assert!(
             !output.contains("window start 6") && !output.contains("compacted chunk 0-9"),
             "the error message reached a label:\n{output}"
+        );
+    }
+
+    // A destructive runtime retention reset must surface a `cause`-split counter, and the label
+    // must never carry the triggering block number or hash.
+    #[test]
+    fn retention_reset_splits_by_cause_without_leaking_identifiers() {
+        let dataset_id = DatasetId::from_str("retention-reset-test");
+
+        report_retention_reset(dataset_id, RetentionResetCause::HashMismatch);
+        report_retention_reset(dataset_id, RetentionResetCause::Gap);
+        report_retention_reset(dataset_id, RetentionResetCause::Gap);
+        report_retention_reset(dataset_id, RetentionResetCause::Cleared);
+
+        let registry = build_metrics_registry();
+        let mut output = String::new();
+        prometheus_client::encoding::text::encode(&mut output, &registry).unwrap();
+
+        let resets = output
+            .lines()
+            .filter(|line| line.starts_with("hotblocks_retention_resets_total"))
+            .filter(|line| line.contains("dataset=\"retention-reset-test\""))
+            .collect::<Vec<_>>();
+        assert!(
+            resets
+                .iter()
+                .any(|line| line.contains("cause=\"hash_mismatch\"") && line.ends_with(" 1")),
+            "missing hash_mismatch reset:\n{output}"
+        );
+        assert!(
+            resets
+                .iter()
+                .any(|line| line.contains("cause=\"gap\"") && line.ends_with(" 2")),
+            "missing gap reset count:\n{output}"
+        );
+        assert!(
+            resets
+                .iter()
+                .any(|line| line.contains("cause=\"cleared\"") && line.ends_with(" 1")),
+            "missing cleared reset:\n{output}"
+        );
+        // The only labels are dataset + cause: nothing that could carry a block number or hash can
+        // slip into the series, even if a future field is added to the label set.
+        assert!(
+            resets.iter().all(|line| {
+                let labels = line.split('{').nth(1).and_then(|s| s.split('}').next()).unwrap_or("");
+                labels.matches("=\"").count() == 2 && labels.contains("dataset=\"") && labels.contains("cause=\"")
+            }),
+            "retention_resets carried an unexpected label:\n{output}"
         );
     }
 
