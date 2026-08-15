@@ -777,6 +777,10 @@ mod tests {
             matches!(ds.endpoints[0].state, EndpointState::Ready),
             "and cancelled its parked backoff so it can rejoin at the new position at once"
         );
+        assert!(
+            matches!(ds.endpoints[1].state, EndpointState::Stream { .. }),
+            "the committing endpoint is skipped by the reset and keeps its live stream"
+        );
     }
 
     // The linkage-reject ladder (`reject_counter`) and the transport-error ladder
