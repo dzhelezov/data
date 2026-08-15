@@ -1648,7 +1648,6 @@ mod tests {
         );
 
         // A populated window destroyed by a parent-hash mismatch: exactly one `hash_mismatch` reset.
-        // Covers the unconditional destructive-arm increment shape that `Gap` shares.
         let mut f = fixture_with_id("retention-reset-hash-mismatch");
         seed_chain(&mut f)?;
         let before = retention_reset_count(f.dataset_id, RetentionResetCause::HashMismatch);
@@ -1660,6 +1659,22 @@ mod tests {
             retention_reset_count(f.dataset_id, RetentionResetCause::HashMismatch),
             before + 1,
             "a hash-mismatch teardown must count exactly one hash_mismatch reset"
+        );
+
+        // A populated window whose only chunk starts above the requested floor, with an uncoverable
+        // gap below it: exactly one `gap` reset. A single chunk `[4..6]` retained from block 2 hits
+        // the gap branch directly — no multi-chunk hole needed.
+        let mut f = fixture_with_id("retention-reset-gap");
+        f.wc.new_chunk(None, &linked_chunk(&f.db, 4, 6, "genesis", "gap")?)?;
+        let before = retention_reset_count(f.dataset_id, RetentionResetCause::Gap);
+        assert!(
+            !f.wc.retain(2, None)?,
+            "a floor below a window that starts above it, with a gap between, clears it"
+        );
+        assert_eq!(
+            retention_reset_count(f.dataset_id, RetentionResetCause::Gap),
+            before + 1,
+            "a gap teardown must count exactly one gap reset"
         );
 
         Ok(())
