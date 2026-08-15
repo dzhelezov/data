@@ -213,24 +213,30 @@ pub(crate) fn report_dataset_epoch_failure(dataset_id: DatasetId, err: &anyhow::
         .inc();
 }
 
-/// Why a runtime retention call tore the whole hot window down instead of trimming it. Both
-/// variants are only reachable through [`WriteController::retain`] (the `delete_mismatch = true`
-/// path); the `init_retention` path refuses the same conditions with an error instead, so it is
-/// already visible as a `dataset_epoch_failures` increment.
+/// Why a retention call tore the whole hot window down instead of trimming it — every increment
+/// means a live ingest lost the head it was building on and must restart from the new floor.
+/// `HashMismatch` and `Gap` are reached only through [`WriteController::retain`] (the
+/// `delete_mismatch = true` path); the `init_retention` path refuses those two with an error
+/// instead. `Cleared` is reachable from either path and is counted only when a populated window
+/// actually existed, so a fresh or already-empty dataset does not register a reset.
 #[derive(Copy, Clone, Hash, Debug, Eq, PartialEq)]
 pub(crate) enum RetentionResetCause {
     /// A stored chunk's parent-block hash did not match the requested anchor — a reorg reaching
     /// below the hot window.
     HashMismatch,
     /// The requested floor sat above the stored chunks with an uncoverable gap between them.
-    Gap
+    Gap,
+    /// The requested floor advanced above every stored chunk, so the whole populated window was
+    /// deleted rather than trimmed.
+    Cleared
 }
 
 impl RetentionResetCause {
     const fn as_str(self) -> &'static str {
         match self {
             Self::HashMismatch => "hash_mismatch",
-            Self::Gap => "gap"
+            Self::Gap => "gap",
+            Self::Cleared => "cleared"
         }
     }
 }
@@ -816,11 +822,12 @@ pub fn build_metrics_registry() -> Registry {
 
     registry.register(
         "retention_resets",
-        "Runtime retention calls that destroyed the hot window instead of trimming it, by dataset \
+        "Retention calls that destroyed a populated hot window instead of trimming it, by dataset \
          and cause. cause=hash_mismatch is a reorg below the hot window (a stored chunk's \
          parent-hash did not match the requested anchor); cause=gap is an uncoverable gap above \
-         the stored chunks. Each increment is a silent full-window rebuild -- a live ingest loses \
-         the head it was building on and must restart from the new floor",
+         the stored chunks; cause=cleared is the floor advancing above the whole window. Each \
+         increment is a silent full-window rebuild -- a live ingest loses the head it was \
+         building on and must restart from the new floor",
         RETENTION_RESETS.clone()
     );
 
@@ -1043,6 +1050,7 @@ mod tests {
         report_retention_reset(dataset_id, RetentionResetCause::HashMismatch);
         report_retention_reset(dataset_id, RetentionResetCause::Gap);
         report_retention_reset(dataset_id, RetentionResetCause::Gap);
+        report_retention_reset(dataset_id, RetentionResetCause::Cleared);
 
         let registry = build_metrics_registry();
         let mut output = String::new();
@@ -1064,6 +1072,21 @@ mod tests {
                 .iter()
                 .any(|line| line.contains("cause=\"gap\"") && line.ends_with(" 2")),
             "missing gap reset count:\n{output}"
+        );
+        assert!(
+            resets
+                .iter()
+                .any(|line| line.contains("cause=\"cleared\"") && line.ends_with(" 1")),
+            "missing cleared reset:\n{output}"
+        );
+        // The only labels are dataset + cause: nothing that could carry a block number or hash can
+        // slip into the series, even if a future field is added to the label set.
+        assert!(
+            resets.iter().all(|line| {
+                let labels = line.split('{').nth(1).and_then(|s| s.split('}').next()).unwrap_or("");
+                labels.matches("=\"").count() == 2 && labels.contains("dataset=\"") && labels.contains("cause=\"")
+            }),
+            "retention_resets carried an unexpected label:\n{output}"
         );
     }
 

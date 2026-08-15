@@ -347,6 +347,12 @@ impl WriteController {
                 false
             }
             Status::Clear => {
+                // Reached both when the window was already empty (benign) and when the floor
+                // advanced above every stored chunk, deleting a live window. Only the latter is a
+                // reset: a present head is proof a populated window was just destroyed.
+                if self.head.is_some() {
+                    report_retention_reset(self.dataset_id, RetentionResetCause::Cleared);
+                }
                 self.clear_heads();
                 info!("dataset was cleared");
                 false
