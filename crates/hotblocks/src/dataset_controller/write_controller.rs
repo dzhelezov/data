@@ -9,7 +9,9 @@ use tracing::{debug, field::valuable, info, instrument, warn};
 use crate::{
     dataset_controller::ingest_generic::{IngestMessage, NewChunk},
     errors::{UnapplicableFork, UnapplicableForkReason as ForkReason},
-    metrics::{WriteStage, report_hash_index_write_metrics, report_write_duration},
+    metrics::{
+        RetentionResetCause, WriteStage, report_hash_index_write_metrics, report_retention_reset, report_write_duration
+    },
     types::{DBRef, DatasetKind}
 };
 
@@ -331,11 +333,13 @@ impl WriteController {
             }
             Status::HashMismatch => {
                 self.clear_heads();
+                report_retention_reset(self.dataset_id, RetentionResetCause::HashMismatch);
                 warn!("cleared dataset due to parent block hash mismatch");
                 false
             }
             Status::Gap(existed) => {
                 self.clear_heads();
+                report_retention_reset(self.dataset_id, RetentionResetCause::Gap);
                 warn!(
                     "cleared dataset, because there was a gap between first requested block {} and already existed {}",
                     from_block, existed
