@@ -266,6 +266,20 @@ pub(crate) fn report_retention_reset(dataset_id: DatasetId, cause: RetentionRese
         .inc();
 }
 
+/// The live value of the `retention_resets` counter for one dataset+cause. Lets a controller test
+/// assert the head-guard's behaviour — that a destructive retention reset increments and an
+/// already-empty clear stays silent — against the same global family the runtime feeds, rather than
+/// re-deriving it. Reading `get_or_create`s a zero series for an untouched pair, which is harmless.
+#[cfg(test)]
+pub(crate) fn retention_reset_count(dataset_id: DatasetId, cause: RetentionResetCause) -> u64 {
+    RETENTION_RESETS
+        .get_or_create(&RetentionResetLabels {
+            dataset: DatasetValue(dataset_id),
+            cause
+        })
+        .get()
+}
+
 static WRITE_DURATION: LazyLock<Family<WriteLabels, Histogram>> =
     LazyLock::new(|| Family::new_with_constructor(|| Histogram::new(buckets(0.0001, 28))));
 
