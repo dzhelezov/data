@@ -13,9 +13,11 @@ struct Endpoint<C: DataClient> {
     client: C,
     state: EndpointState<C::Block>,
     error_counter: usize,
-    /// Consecutive parent-hash linkage rejections at the current position. Reset on any committed
-    /// block; drives an exponential backoff (like `error_counter`) so a source stuck streaming a
-    /// non-linking block cannot spin re-requesting the same position hot.
+    /// Consecutive parent-hash linkage rejections at the current position. Reset on a committed
+    /// block or an external reposition (`set_position`), so the strike stays scoped to the position
+    /// it was accrued at; drives an exponential backoff so a source stuck streaming a non-linking
+    /// block cannot spin re-requesting the same position hot. Unlike `error_counter`, a mere
+    /// successful stream *response* does not clear it — only real forward progress does.
     reject_counter: usize,
     last_committed_block: Option<BlockNumber>
 }
@@ -454,6 +456,7 @@ where
         for ep in self.endpoints.iter_mut() {
             ep.state = EndpointState::Ready;
             ep.last_committed_block = None;
+            ep.reject_counter = 0;
         }
     }
 
@@ -668,6 +671,40 @@ mod tests {
             reject_count(source) - before,
             1,
             "exactly one rejection preceded the accepted block"
+        );
+    }
+
+    // An external reposition scopes out any strike accrued at the old position, holding the field's
+    // "at the current position" contract. Negative control for the `set_position` reset: without it,
+    // the old-position strike (and its backoff) would leak into the fresh position.
+    #[tokio::test(start_paused = true)]
+    async fn a_reposition_clears_the_reject_strike() {
+        let source = "test-reposition-clears";
+        let non_linking = TestBlock::new(10, "0xB10", "0xWRONG_PARENT");
+        let mut ds = build(source, vec![vec![non_linking]]);
+        ds.set_position(10, Some("0xEXPECTED_PARENT"));
+
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let _ = ds.poll_next_event(&mut cx);
+        assert!(
+            ds.endpoints[0].reject_counter > 0,
+            "precondition: a strike accrued at the old position"
+        );
+        assert!(
+            matches!(ds.endpoints[0].state, EndpointState::Backoff(_)),
+            "precondition: parked in backoff"
+        );
+
+        ds.set_position(20, Some("0xNEW_PARENT"));
+
+        assert_eq!(
+            ds.endpoints[0].reject_counter, 0,
+            "a reposition clears the old-position strike"
+        );
+        assert!(
+            matches!(ds.endpoints[0].state, EndpointState::Ready),
+            "a reposition also cancels the backoff"
         );
     }
 }
