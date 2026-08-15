@@ -819,6 +819,17 @@ pub fn build_metrics_registry() -> Registry {
     );
 
     registry.register(
+        "ingest_linkage_rejects",
+        "Well-formed blocks a source streamed at our position that failed the parent-hash linkage \
+         check and were rejected without committing, by source endpoint and reason \
+         (reason=parent_hash_mismatch). A rejection re-requests the same position, so a source \
+         stuck emitting a non-linking block would spin hot; consecutive rejects drive an \
+         exponential per-source backoff. Distinct from ingest_source_errors (transport/parse) and \
+         ingest_fork_signals (in-spec 409 reorg hints)",
+        sqd_data_source::metrics::INGEST_LINKAGE_REJECTS.clone()
+    );
+
+    registry.register(
         "ingest_fork_consensus_duration_seconds",
         "Time from the first upstream fork signal until fork consensus, by decision path \
          (majority/all_active/timeout)",

@@ -13,6 +13,10 @@ struct Endpoint<C: DataClient> {
     client: C,
     state: EndpointState<C::Block>,
     error_counter: usize,
+    /// Consecutive parent-hash linkage rejections at the current position. Reset on any committed
+    /// block; drives an exponential backoff (like `error_counter`) so a source stuck streaming a
+    /// non-linking block cannot spin re-requesting the same position hot.
+    reject_counter: usize,
     last_committed_block: Option<BlockNumber>
 }
 
@@ -103,10 +107,11 @@ impl<F> DataSourceState<F> {
                                 if block.number() >= self.position.first_block {
                                     let is_final = *finalized_head >= block.number();
                                     if self.accept_new_block(&block, is_final) {
+                                        ep.reject_counter = 0;
                                         ep.last_committed_block = Some(block.number());
                                         return Poll::Ready(DataEvent::Block { block, is_final });
                                     } else {
-                                        ep.state = EndpointState::Ready;
+                                        ep.on_reject("parent_hash_mismatch");
                                     }
                                 }
                             }
@@ -240,8 +245,7 @@ impl<C: DataClient> Endpoint<C> {
     fn on_error(&mut self, error: anyhow::Error) {
         crate::metrics::record_ingest_source_error(&self.client.source_label(), self.client.error_kind(&error));
 
-        let backoff = [0, 100, 200, 500, 1000, 2000, 5000, 10000];
-        let pause = backoff[std::cmp::min(self.error_counter, backoff.len() - 1)];
+        let pause = backoff_ms(self.error_counter);
         if pause > 0 {
             warn!(
                 error =? error,
@@ -264,6 +268,45 @@ impl<C: DataClient> Endpoint<C> {
         };
         self.error_counter += 1;
     }
+
+    /// A well-formed block that did not extend our chain (parent-hash mismatch). Unlike `on_error`
+    /// this is not a transport/parse fault, but it re-requests the same position, so a source stuck
+    /// emitting a non-linking block would spin hot. Escalate the same backoff ladder on consecutive
+    /// rejects (reset by the next committed block) so the re-request rate is bounded, and record it
+    /// so the loop is visible. The first reject keeps the original zero-latency retry.
+    fn on_reject(&mut self, reason: &'static str) {
+        crate::metrics::record_ingest_linkage_reject(&self.client.source_label(), reason);
+
+        let pause = backoff_ms(self.reject_counter);
+        if pause > 0 {
+            warn!(
+                reason,
+                data_source =? self.client,
+                "data source streamed a non-linking block, will disable it for {} ms",
+                pause
+            )
+        } else {
+            warn!(
+                reason,
+                data_source =? self.client,
+                "data source streamed a non-linking block",
+            )
+        }
+        self.state = if pause > 0 {
+            let sleep = tokio::time::sleep(Duration::from_millis(pause));
+            EndpointState::Backoff(Box::pin(sleep))
+        } else {
+            EndpointState::Ready
+        };
+        self.reject_counter += 1;
+    }
+}
+
+/// Shared exponential backoff ladder (ms) for a single endpoint's consecutive faults. Index is
+/// clamped to the last rung, so the pause tops out at 10s however long a fault persists.
+fn backoff_ms(consecutive: usize) -> u64 {
+    const BACKOFF_MS: [u64; 8] = [0, 100, 200, 500, 1000, 2000, 5000, 10000];
+    BACKOFF_MS[std::cmp::min(consecutive, BACKOFF_MS.len() - 1)]
 }
 
 impl<B, C, F> StandardDataSource<C, F>
@@ -278,6 +321,7 @@ where
             .map(|client| Endpoint {
                 client,
                 error_counter: 0,
+                reject_counter: 0,
                 state: EndpointState::Ready,
                 last_committed_block: None
             })
@@ -419,5 +463,211 @@ where
 
     fn get_parent_block_hash(&self) -> Option<&str> {
         self.state.position.parent_block_hash.as_deref()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        collections::VecDeque,
+        sync::{Arc, Mutex},
+        task::{Context, Poll}
+    };
+
+    use futures::{stream, task::noop_waker, FutureExt, StreamExt};
+    use sqd_data_client::{BlockStreamRequest, BlockStreamResponse, DataClient};
+    use sqd_primitives::{Block, BlockNumber, BlockRef};
+
+    use super::{backoff_ms, EndpointState, StandardDataSource};
+    use crate::{
+        metrics::INGEST_LINKAGE_REJECTS,
+        types::{DataEvent, DataSource}
+    };
+
+    #[derive(Debug, Clone)]
+    struct TestBlock {
+        number: BlockNumber,
+        hash: String,
+        parent_hash: String
+    }
+
+    impl TestBlock {
+        fn new(number: BlockNumber, hash: &str, parent_hash: &str) -> Self {
+            Self {
+                number,
+                hash: hash.to_string(),
+                parent_hash: parent_hash.to_string()
+            }
+        }
+    }
+
+    impl Block for TestBlock {
+        fn number(&self) -> BlockNumber {
+            self.number
+        }
+        fn hash(&self) -> &str {
+            &self.hash
+        }
+        fn parent_number(&self) -> BlockNumber {
+            self.number.saturating_sub(1)
+        }
+        fn parent_hash(&self) -> &str {
+            &self.parent_hash
+        }
+    }
+
+    /// A client that replays canned batches. `stream()` advances through the queue and repeats the
+    /// last batch once exhausted, so "the source is permanently stuck on a non-linking block" is one
+    /// queued batch, while "one bad block then a good one" is two.
+    #[derive(Debug)]
+    struct ReplayClient {
+        source: String,
+        batches: Arc<Mutex<VecDeque<Vec<TestBlock>>>>
+    }
+
+    impl ReplayClient {
+        fn new(source: &str, batches: Vec<Vec<TestBlock>>) -> Self {
+            Self {
+                source: source.to_string(),
+                batches: Arc::new(Mutex::new(batches.into()))
+            }
+        }
+    }
+
+    impl DataClient for ReplayClient {
+        type Block = TestBlock;
+
+        fn stream(
+            &self,
+            _req: BlockStreamRequest
+        ) -> futures::future::BoxFuture<'static, anyhow::Result<BlockStreamResponse<TestBlock>>> {
+            let mut queue = self.batches.lock().unwrap();
+            let batch = if queue.len() > 1 {
+                queue.pop_front().unwrap()
+            } else {
+                queue.front().cloned().unwrap_or_default()
+            };
+            async move {
+                Ok(BlockStreamResponse::Stream {
+                    finalized_head: None,
+                    blocks: stream::iter(batch.into_iter().map(anyhow::Ok)).boxed()
+                })
+            }
+            .boxed()
+        }
+
+        fn get_finalized_head(&self) -> futures::future::BoxFuture<'static, anyhow::Result<Option<BlockRef>>> {
+            async { Ok(None) }.boxed()
+        }
+
+        fn is_retryable(&self, _err: &anyhow::Error) -> bool {
+            true
+        }
+
+        fn source_label(&self) -> String {
+            self.source.clone()
+        }
+    }
+
+    fn reject_count(source: &str) -> u64 {
+        INGEST_LINKAGE_REJECTS
+            .get_or_create(&vec![
+                ("source", source.to_string()),
+                ("reason", "parent_hash_mismatch".to_string()),
+            ])
+            .get()
+    }
+
+    fn build(
+        source: &str,
+        batches: Vec<Vec<TestBlock>>
+    ) -> StandardDataSource<ReplayClient, fn(TestBlock) -> anyhow::Result<TestBlock>> {
+        StandardDataSource::new(
+            vec![ReplayClient::new(source, batches)],
+            Ok as fn(TestBlock) -> anyhow::Result<TestBlock>
+        )
+    }
+
+    #[test]
+    fn backoff_ladder_is_shared_and_clamped_to_ten_seconds() {
+        assert_eq!(
+            backoff_ms(0),
+            0,
+            "the first fault must keep the original zero-latency retry"
+        );
+        assert_eq!(backoff_ms(1), 100);
+        assert_eq!(backoff_ms(2), 200);
+        assert_eq!(backoff_ms(7), 10_000);
+        // Past the last rung the pause must clamp, never index out of bounds.
+        assert_eq!(backoff_ms(8), 10_000);
+        assert_eq!(backoff_ms(1_000_000), 10_000);
+    }
+
+    // A source permanently streaming a block that does not link at our position used to reset
+    // straight back to Ready and re-request the same position with no pause — a hot loop. After the
+    // fix, the free first retry is followed by a backoff, so a single poll parks the endpoint at
+    // strike 2 instead of spinning, and every rejection is counted. Pre-fix there is no
+    // `reject_counter`/`Backoff` on this path at all, so this terminal state is unreachable.
+    #[tokio::test(start_paused = true)]
+    async fn persistent_linkage_mismatch_backs_off_instead_of_spinning() {
+        let source = "test-persistent-reject";
+        let before = reject_count(source);
+        let non_linking = TestBlock::new(10, "0xB10", "0xWRONG_PARENT");
+        let mut ds = build(source, vec![vec![non_linking]]);
+        ds.set_position(10, Some("0xEXPECTED_PARENT"));
+
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let poll = ds.poll_next_event(&mut cx);
+
+        assert!(
+            matches!(poll, Poll::Pending),
+            "the endpoint must park in backoff, not emit a block"
+        );
+        assert_eq!(
+            ds.endpoints[0].reject_counter, 2,
+            "free retry then an escalating strike"
+        );
+        assert!(
+            matches!(ds.endpoints[0].state, EndpointState::Backoff(_)),
+            "a persistent reject must install a backoff sleep"
+        );
+        assert_eq!(
+            reject_count(source) - before,
+            2,
+            "every rejection is recorded, backoff or not"
+        );
+    }
+
+    // A committed block clears the consecutive-reject strike, so a transient one-off mismatch
+    // followed by a good block accrues no lasting penalty. The counter is 0 at the end only because
+    // the accept path resets it: the intervening rejection did happen (the metric proves +1), so
+    // this doubles as the negative control for the `reject_counter = 0` reset line.
+    #[tokio::test(start_paused = true)]
+    async fn a_committed_block_resets_the_reject_strike() {
+        let source = "test-reject-reset";
+        let before = reject_count(source);
+        let non_linking = TestBlock::new(10, "0xB10bad", "0xWRONG_PARENT");
+        let linking = TestBlock::new(10, "0xB10good", "0xEXPECTED_PARENT");
+        let mut ds = build(source, vec![vec![non_linking], vec![linking]]);
+        ds.set_position(10, Some("0xEXPECTED_PARENT"));
+
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let poll = ds.poll_next_event(&mut cx);
+
+        match poll {
+            Poll::Ready(DataEvent::Block { block, .. }) => assert_eq!(block.number(), 10),
+            other => panic!(
+                "expected the linking block to commit, got {:?}",
+                matches!(other, Poll::Pending)
+            )
+        }
+        assert_eq!(ds.endpoints[0].reject_counter, 0, "a committed block resets the strike");
+        assert_eq!(
+            reject_count(source) - before,
+            1,
+            "exactly one rejection preceded the accepted block"
+        );
     }
 }
