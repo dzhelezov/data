@@ -300,6 +300,9 @@ impl<C: DataClient> Endpoint<C> {
         } else {
             EndpointState::Ready
         };
+        // Increment AFTER deriving `pause` from the pre-increment counter: the first reject
+        // (counter 0 → pause 0) keeps the original free zero-latency retry, and only the second
+        // consecutive reject onward installs a backoff.
         self.reject_counter += 1;
     }
 }
@@ -346,11 +349,35 @@ where
     }
 
     fn poll_next_event(&mut self, cx: &mut std::task::Context<'_>) -> Poll<DataEvent<B>> {
-        for ep in self.endpoints.iter_mut() {
+        let mut committed = None;
+        for (i, ep) in self.endpoints.iter_mut().enumerate() {
             let event = self.state.poll_endpoint(ep, cx);
             if event.is_ready() {
-                return event;
+                committed = Some((i, event));
+                break;
             }
+        }
+        if let Some((committed_idx, event)) = committed {
+            // A committed block advances the shared position (`accept_new_block`), and a
+            // linkage-reject strike is scoped to the position it was accrued at — so once the
+            // position moves forward, every *other* endpoint's strike is stale. Clear their
+            // counters and cancel any parked backoff; otherwise an endpoint that rejected at the
+            // old position stays asleep at the new one for up to the full 10 s rung, needlessly
+            // delaying it from rejoining a position it may now link (a multi-endpoint failover
+            // regression). The committing endpoint already reset its own counter and must keep its
+            // live stream, so it is skipped.
+            if matches!(event, Poll::Ready(DataEvent::Block { .. })) {
+                for (j, other) in self.endpoints.iter_mut().enumerate() {
+                    if j == committed_idx {
+                        continue;
+                    }
+                    other.reject_counter = 0;
+                    if matches!(other.state, EndpointState::Backoff(_)) {
+                        other.state = EndpointState::Ready;
+                    }
+                }
+            }
+            return event;
         }
 
         let forks = self.endpoints.iter().filter(|ep| ep.is_on_fork()).count();
@@ -474,14 +501,15 @@ mod tests {
     use std::{
         collections::VecDeque,
         sync::{Arc, Mutex},
-        task::{Context, Poll}
+        task::{Context, Poll},
+        time::Duration
     };
 
     use futures::{stream, task::noop_waker, FutureExt, StreamExt};
     use sqd_data_client::{BlockStreamRequest, BlockStreamResponse, DataClient};
     use sqd_primitives::{Block, BlockNumber, BlockRef};
 
-    use super::{backoff_ms, EndpointState, StandardDataSource};
+    use super::{backoff_ms, Endpoint, EndpointState, StandardDataSource};
     use crate::{
         metrics::INGEST_LINKAGE_REJECTS,
         types::{DataEvent, DataSource}
@@ -706,5 +734,107 @@ mod tests {
             matches!(ds.endpoints[0].state, EndpointState::Ready),
             "a reposition also cancels the backoff"
         );
+    }
+
+    // Multi-endpoint regression: a committed block advances the shared position, and a
+    // linkage-reject strike is scoped to the position it was accrued at, so the commit must clear
+    // every *other* endpoint's now-stale strike and cancel its parked backoff. Endpoint order is
+    // broken-first: it rejects at position 10 and parks in backoff, then the healthy endpoint
+    // commits block 10 and moves the position to 11. Before the fix the broken endpoint stayed
+    // asleep for the old position's full backoff though the position had already moved — a
+    // multi-endpoint failover regression; this is the negative control for the reset in
+    // `poll_next_event`.
+    #[tokio::test(start_paused = true)]
+    async fn a_committed_block_clears_the_other_endpoints_stale_strike() {
+        let broken = ReplayClient::new("xep-broken", vec![vec![TestBlock::new(10, "0xBAD", "0xWRONG_PARENT")]]);
+        let healthy = ReplayClient::new(
+            "xep-healthy",
+            vec![vec![TestBlock::new(10, "0xGOOD", "0xEXPECTED_PARENT")]]
+        );
+        let mut ds = StandardDataSource::new(vec![broken, healthy], Ok as fn(TestBlock) -> anyhow::Result<TestBlock>);
+        ds.set_position(10, Some("0xEXPECTED_PARENT"));
+
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        match ds.poll_next_event(&mut cx) {
+            Poll::Ready(DataEvent::Block { block, .. }) => assert_eq!(block.number(), 10),
+            other => panic!(
+                "expected the healthy endpoint to commit block 10, pending={}",
+                matches!(other, Poll::Pending)
+            )
+        }
+
+        assert_eq!(
+            ds.get_next_block(),
+            11,
+            "the committed block advanced the shared position"
+        );
+        assert_eq!(
+            ds.endpoints[0].reject_counter, 0,
+            "the commit cleared the broken endpoint's stale old-position strike"
+        );
+        assert!(
+            matches!(ds.endpoints[0].state, EndpointState::Ready),
+            "and cancelled its parked backoff so it can rejoin at the new position at once"
+        );
+    }
+
+    // The linkage-reject ladder (`reject_counter`) and the transport-error ladder
+    // (`error_counter`) are independent: neither fault clears the other's strike. Load-bearing —
+    // a source flapping between a transport blip and a linkage reject must still climb toward a
+    // backoff rather than perpetually resetting itself. Drives an `Endpoint` directly so the two
+    // paths are exercised in isolation.
+    #[tokio::test(start_paused = true)]
+    async fn the_reject_and_error_ladders_are_independent() {
+        let mut ep = Endpoint {
+            client: ReplayClient::new("test-ladders", vec![vec![]]),
+            state: EndpointState::Ready,
+            error_counter: 0,
+            reject_counter: 0,
+            last_committed_block: None
+        };
+
+        ep.on_reject("parent_hash_mismatch");
+        ep.on_reject("parent_hash_mismatch");
+        assert_eq!(ep.reject_counter, 2, "two rejects climb the reject ladder");
+
+        ep.on_error(anyhow::anyhow!("transport blip"));
+        assert_eq!(
+            ep.reject_counter, 2,
+            "a transport error must not clear the linkage-reject strike"
+        );
+        assert_eq!(ep.error_counter, 1, "on_error advances only its own ladder");
+
+        ep.on_reject("parent_hash_mismatch");
+        assert_eq!(ep.error_counter, 1, "a linkage reject must not clear the error strike");
+        assert_eq!(ep.reject_counter, 3);
+    }
+
+    // The parked backoff actually resolves and the next reject escalates one rung. `start_paused`
+    // freezes the 100 ms sleep until the clock is advanced; after it is, the endpoint re-requests,
+    // rejects again, and installs the next (200 ms) rung. Covers the `EndpointState::Backoff`
+    // resolution path the other tests only park in.
+    #[tokio::test(start_paused = true)]
+    async fn a_resolved_backoff_lets_the_next_reject_escalate() {
+        let source = "test-escalate";
+        let mut ds = build(source, vec![vec![TestBlock::new(10, "0xB10", "0xWRONG_PARENT")]]);
+        ds.set_position(10, Some("0xEXPECTED_PARENT"));
+
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        assert!(matches!(ds.poll_next_event(&mut cx), Poll::Pending));
+        assert_eq!(
+            ds.endpoints[0].reject_counter, 2,
+            "free retry then the first backoff rung"
+        );
+        assert!(matches!(ds.endpoints[0].state, EndpointState::Backoff(_)));
+
+        tokio::time::advance(Duration::from_millis(101)).await;
+        assert!(matches!(ds.poll_next_event(&mut cx), Poll::Pending));
+        assert_eq!(
+            ds.endpoints[0].reject_counter, 3,
+            "the resolved backoff let the next reject install the next rung"
+        );
+        assert!(matches!(ds.endpoints[0].state, EndpointState::Backoff(_)));
     }
 }
