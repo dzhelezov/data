@@ -5,7 +5,7 @@ use std::{
 };
 
 use anyhow::{Context, anyhow};
-use futures::{FutureExt, StreamExt, TryStreamExt};
+use futures::{FutureExt, StreamExt};
 use sqd_data_client::reqwest::ReqwestDataClient;
 use sqd_storage::db::{CF_TABLES, DatasetId};
 use tracing::{error, info, warn};
@@ -90,22 +90,61 @@ impl DataService {
                         Arc::new(c)
                     })
                 })
-                .map(move |res| res.with_context(|| anyhow!("failed to initialize dataset {}", dataset_id)))
+                // Flatten the blocking task's JoinError (a panic or cancellation of the init) into
+                // this dataset's own result, tagged with its id, so one dataset's failure is
+                // attributed and isolated below -- never a fail-all via `?` (audit N2 / FM-a).
+                .map(move |res| {
+                    let ctl = match res {
+                        Ok(inner) => inner,
+                        Err(join_err) => Err(anyhow::Error::new(join_err))
+                    }
+                    .with_context(|| anyhow!("failed to initialize dataset {}", dataset_id));
+                    (dataset_id, ctl)
+                })
             })
             .buffered(5);
 
         let mut datasets = HashMap::new();
+        let mut failed: Vec<DatasetId> = Vec::new();
 
-        while let Some(ctl) = controllers.try_next().await?.transpose()? {
-            datasets.insert(ctl.dataset_id(), ctl);
+        // Collect every controller: a single dataset's init failure must not take down the others
+        // (INV-36 / CN-10). Each outcome is attributed to its dataset and exposed as a 0/1 gauge.
+        while let Some((dataset_id, result)) = controllers.next().await {
+            match result {
+                Ok(ctl) => {
+                    crate::metrics::report_dataset_boot_ready(dataset_id, true);
+                    datasets.insert(ctl.dataset_id(), ctl);
+                }
+                Err(err) => {
+                    crate::metrics::report_dataset_boot_ready(dataset_id, false);
+                    error!(
+                        dataset = %dataset_id,
+                        error =? err,
+                        "dataset controller initialization failed; other datasets keep serving"
+                    );
+                    failed.push(dataset_id);
+                }
+            }
         }
 
         info!(
             configured_datasets,
             datasets_ready = datasets.len(),
+            datasets_failed = failed.len(),
             elapsed_ms = controller_init_started.elapsed().as_millis() as u64,
             "dataset controller initialization complete"
         );
+
+        // Narrow all-fail floor: refuse to start only when every configured dataset failed, so a
+        // total init outage cannot masquerade as a healthy empty service (INV-43 permits a
+        // dataset's own startup failure, not the service's). An empty configuration still boots, as
+        // it does today -- an orthogonal config-policy question, deliberately out of scope here.
+        if configured_datasets > 0 && datasets.is_empty() {
+            anyhow::bail!(
+                "all {} configured dataset(s) failed to initialize; refusing to start",
+                configured_datasets
+            );
+        }
 
         Ok(Self { datasets })
     }

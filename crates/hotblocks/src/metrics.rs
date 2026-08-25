@@ -111,6 +111,8 @@ static INGEST_WITHHELD_FLUSHES: LazyLock<Family<DatasetLabel, Counter>> = LazyLo
 
 static INGEST_FLUSH_FLOOR: LazyLock<Family<DatasetLabel, Gauge>> = LazyLock::new(Default::default);
 
+static DATASET_BOOT_READY: LazyLock<Family<DatasetLabel, Gauge>> = LazyLock::new(Default::default);
+
 pub static STREAM_DURATIONS: LazyLock<Family<Labels, Histogram>> =
     LazyLock::new(|| Family::new_with_constructor(|| Histogram::new(exponential_buckets(0.01, 2.0, 20))));
 pub static STREAM_BYTES: LazyLock<Family<Labels, Histogram>> =
@@ -317,6 +319,16 @@ pub(crate) fn report_flush_floor(dataset_id: DatasetId, floor: Option<BlockNumbe
     INGEST_FLUSH_FLOOR
         .get_or_create(&dataset_label!(dataset_id))
         .set(floor.map_or(-1, |block| i64::try_from(block).unwrap_or(i64::MAX)));
+}
+
+/// Per-configured-dataset boot outcome: 1 = the controller initialized and the dataset is being
+/// served, 0 = its init failed and it was skipped while the rest of the service kept running. A
+/// dataset that is not configured has no series; if *no* series appear at all the process failed to
+/// start (an all-fail boot bails before serving metrics -- pair this with a process-down alert).
+pub(crate) fn report_dataset_boot_ready(dataset_id: DatasetId, ready: bool) {
+    DATASET_BOOT_READY
+        .get_or_create(&dataset_label!(dataset_id))
+        .set(ready as i64);
 }
 
 pub fn report_query_too_many_tasks_error() {
@@ -908,6 +920,15 @@ pub fn build_metrics_registry() -> Registry {
         INGEST_FLUSH_FLOOR.clone()
     );
 
+    registry.register(
+        "dataset_boot_ready",
+        "Per-configured-dataset boot outcome: 1 = the controller initialized and the dataset is \
+         serving, 0 = its init failed and the dataset was skipped while the rest of the service \
+         kept running. No series at all means the process failed to start (every configured \
+         dataset failed) -- pair with a process-down alert",
+        DATASET_BOOT_READY.clone()
+    );
+
     top_registry
 }
 
@@ -1131,6 +1152,28 @@ mod tests {
         let mut output = String::new();
         prometheus_client::encoding::text::encode(&mut output, &build_metrics_registry()).unwrap();
         assert!(floor_line(&output).ends_with(" -1"), "{}", floor_line(&output));
+    }
+
+    #[test]
+    fn dataset_boot_ready_gauge_reflects_init_outcome() {
+        let dataset_id = DatasetId::from_str("boot-ready-test");
+        let ready_line = |output: &str| -> String {
+            output
+                .lines()
+                .find(|line| line.starts_with("hotblocks_dataset_boot_ready") && line.contains("boot-ready-test"))
+                .unwrap_or_else(|| panic!("no dataset boot ready series:\n{output}"))
+                .to_string()
+        };
+
+        report_dataset_boot_ready(dataset_id, true);
+        let mut output = String::new();
+        prometheus_client::encoding::text::encode(&mut output, &build_metrics_registry()).unwrap();
+        assert!(ready_line(&output).ends_with(" 1"), "{}", ready_line(&output));
+
+        report_dataset_boot_ready(dataset_id, false);
+        let mut output = String::new();
+        prometheus_client::encoding::text::encode(&mut output, &build_metrics_registry()).unwrap();
+        assert!(ready_line(&output).ends_with(" 0"), "{}", ready_line(&output));
     }
 
     #[test]
