@@ -113,6 +113,16 @@ impl Sut {
         self.boot().await
     }
 
+    /// Replace the dataset configuration that the next [`restart`](Self::restart)/[`boot`](Self::boot)
+    /// will load. The database on disk is left untouched, so a dataset can be re-declared with a
+    /// different `kind` and the reboot then hits the storage-layer identity guard
+    /// (`create_dataset_if_not_exists`) — the operator-error / config-drift path the CT-5 boot matrix
+    /// exercises. Call while the process is stopped; it does not restart on its own.
+    pub fn set_datasets(&mut self, datasets: Vec<DatasetSpec>) -> Result<()> {
+        self.cfg.datasets = datasets;
+        self.write_config()
+    }
+
     /// SIGKILL: the process loses everything not committed (CN-6, `P-DUR-PROCESS = 0`).
     pub async fn crash(&mut self) -> Result<()> {
         let Some(child) = self.child.as_mut() else {
