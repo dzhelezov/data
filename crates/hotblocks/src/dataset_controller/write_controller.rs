@@ -1482,6 +1482,63 @@ mod tests {
         Ok(())
     }
 
+    // Audit N2 FM-b / DQ-C: a boot-time `init_retention` (`delete_mismatch = false`) that bails must
+    // leave the on-disk window's chunk set unchanged. `_retain` scans chunks in ascending order
+    // inside ONE transaction closure: below-floor chunks are `delete_chunk`'d first, then a
+    // gap/hash-mismatch `bail!`s. Because `Tx::run` returns the closure `Err` *before* `commit()`,
+    // the whole transaction — including those below-floor deletes — is discarded. This is the
+    // load-bearing fact behind the FM-b "no durable-corruption-compounding hazard" finding: a
+    // durably-broken dataset fails init atomically and reproduces the identical failure each reboot
+    // (asserted below), never degrading.
+    //
+    // Non-vacuity depends on `_retain` deleting the below-floor chunk *before* it bails — the
+    // sibling `retain(7)` test uses `delete_mismatch = true` (no bail), so it cannot cover this
+    // interleaving; the delete-then-bail ordering is precisely what this guard protects. Verified
+    // empirically (committee mutation probe): committing on the closure-`Err` path drops [0, 5] and
+    // this test FAILS. (The assertion checks chunk *presence*, not every CF/index marker; those are
+    // covered by the same transaction's atomicity.)
+    #[test]
+    fn init_retention_bail_rolls_back_the_below_floor_deletes() -> anyhow::Result<()> {
+        let mut f = fixture();
+        let (first, second) = seed_chain(&mut f)?;
+        // Sanity: the sibling test above proves `retain(7)` (delete_mismatch = true) DOES drop
+        // [0, 5]; so the survival asserted below is rollback, not a no-op.
+
+        // Floor 6 puts [0, 5] below the window (⇒ `delete_chunk` attempted) while block 6 lands at
+        // the first block of [6, 9]; the wrong parent hash makes the boundary check mismatch, and
+        // with delete_mismatch = false that is the N3-boot `bail!`.
+        let result = f.wc.init_retention(6, Some("not-the-real-parent".to_string()));
+
+        let err = result.unwrap_err();
+        assert!(
+            format!("{err:#}").contains("hash mismatch"),
+            "expected the delete_mismatch=false hash-mismatch bail, got: {err:#}"
+        );
+        // The transaction rolled back: BOTH chunks survive, including the below-floor [0, 5] that
+        // `_retain` had already `delete_chunk`'d before the bail.
+        assert_eq!(
+            stored_chunks(&f)?,
+            vec![first.clone(), second.clone()],
+            "a bailing init_retention must not durably delete any chunk"
+        );
+
+        // Idempotence / "reproduces identically each reboot": a second boot-time attempt against the
+        // still-broken window fails the same way and again leaves both chunks intact.
+        let err2 =
+            f.wc.init_retention(6, Some("not-the-real-parent".to_string()))
+                .unwrap_err();
+        assert!(
+            format!("{err2:#}").contains("hash mismatch"),
+            "the retry must reproduce the same hash-mismatch bail, got: {err2:#}"
+        );
+        assert_eq!(
+            stored_chunks(&f)?,
+            vec![first, second],
+            "a repeated bailing init_retention must remain a no-op on disk"
+        );
+        Ok(())
+    }
+
     // A fork that cannot reach up to finality is refused, never resumed below it.
     #[test]
     fn rollback_with_all_hints_below_finalized_head_is_refused() -> anyhow::Result<()> {
