@@ -104,27 +104,25 @@ impl DataService {
             })
             .buffered(5);
 
-        let mut datasets = HashMap::new();
-        let mut failed: Vec<DatasetId> = Vec::new();
+        // Drain every controller outcome before deciding anything: a single dataset's init failure
+        // must not take down the others (INV-36 / CN-10). The split is deliberate -- `partition`
+        // attributes the outcomes, then the readiness gauges and the completion log are emitted, and
+        // only then is the all-fail floor enforced, so a total outage is fully observed (every
+        // failure gauge + the summary line) before the process refuses to start.
+        let mut outcomes = Vec::with_capacity(configured_datasets);
+        while let Some(outcome) = controllers.next().await {
+            outcomes.push(outcome);
+        }
 
-        // Collect every controller: a single dataset's init failure must not take down the others
-        // (INV-36 / CN-10). Each outcome is attributed to its dataset and exposed as a 0/1 gauge.
-        while let Some((dataset_id, result)) = controllers.next().await {
-            match result {
-                Ok(ctl) => {
-                    crate::metrics::report_dataset_boot_ready(dataset_id, true);
-                    datasets.insert(ctl.dataset_id(), ctl);
-                }
-                Err(err) => {
-                    crate::metrics::report_dataset_boot_ready(dataset_id, false);
-                    error!(
-                        dataset = %dataset_id,
-                        error =? err,
-                        "dataset controller initialization failed; other datasets keep serving"
-                    );
-                    failed.push(dataset_id);
-                }
-            }
+        let (ready, failed) = Self::partition_boot_outcomes(outcomes);
+
+        let mut datasets = HashMap::with_capacity(ready.len());
+        for (dataset_id, ctl) in ready {
+            crate::metrics::report_dataset_boot_ready(dataset_id, true);
+            datasets.insert(ctl.dataset_id(), ctl);
+        }
+        for &dataset_id in &failed {
+            crate::metrics::report_dataset_boot_ready(dataset_id, false);
         }
 
         info!(
@@ -135,18 +133,53 @@ impl DataService {
             "dataset controller initialization complete"
         );
 
-        // Narrow all-fail floor: refuse to start only when every configured dataset failed, so a
-        // total init outage cannot masquerade as a healthy empty service (INV-43 permits a
-        // dataset's own startup failure, not the service's). An empty configuration still boots, as
-        // it does today -- an orthogonal config-policy question, deliberately out of scope here.
-        if configured_datasets > 0 && datasets.is_empty() {
+        Self::enforce_all_fail_floor(configured_datasets, datasets.len())?;
+
+        Ok(Self { datasets })
+    }
+
+    /// Partition per-dataset boot outcomes into the controllers that initialized and the ids that
+    /// failed. Pure over the controller type `T` and free of DB/metric side effects, so the
+    /// isolation policy -- one dataset's failure never drops another -- is unit-testable without
+    /// storage. Each failure is logged with its dataset id; the caller emits the readiness gauge
+    /// from the returned lists and then applies `enforce_all_fail_floor`.
+    fn partition_boot_outcomes<T>(
+        outcomes: Vec<(DatasetId, anyhow::Result<T>)>
+    ) -> (Vec<(DatasetId, T)>, Vec<DatasetId>) {
+        let mut ready = Vec::new();
+        let mut failed = Vec::new();
+
+        for (dataset_id, result) in outcomes {
+            match result {
+                Ok(ctl) => ready.push((dataset_id, ctl)),
+                Err(err) => {
+                    error!(
+                        dataset = %dataset_id,
+                        error =? err,
+                        "dataset controller initialization failed; other datasets keep serving"
+                    );
+                    failed.push(dataset_id);
+                }
+            }
+        }
+
+        (ready, failed)
+    }
+
+    /// The narrow all-fail floor: refuse to start only when every configured dataset failed, so a
+    /// total init outage cannot masquerade as a healthy empty service (INV-43 permits a dataset's
+    /// own startup failure, not the service's). `start` applies this *after* the readiness gauges
+    /// and the completion log are emitted, so an all-fail boot is fully observed before it bails. An
+    /// empty configuration still boots, as it does today -- an orthogonal config-policy question,
+    /// deliberately out of scope here.
+    fn enforce_all_fail_floor(configured_datasets: usize, ready_datasets: usize) -> anyhow::Result<()> {
+        if configured_datasets > 0 && ready_datasets == 0 {
             anyhow::bail!(
                 "all {} configured dataset(s) failed to initialize; refusing to start",
                 configured_datasets
             );
         }
-
-        Ok(Self { datasets })
+        Ok(())
     }
 
     pub fn get_dataset(&self, dataset_id: DatasetId) -> Result<Arc<DatasetController>, UnknownDataset> {
@@ -253,5 +286,75 @@ fn table_sst_bytes(db: &DBRef) -> Option<u64> {
             warn!(error =? err, "failed to read live SST size");
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use anyhow::anyhow;
+    use sqd_storage::db::DatasetId;
+
+    use super::DataService;
+
+    // A controller stand-in: `partition_boot_outcomes` is pure over the controller type, so the
+    // boot-supervision policy is exercised without a DB, network, or spawned tasks. Each test walks
+    // `start`'s exact sequence -- partition, then the floor over the ready count -- so the two
+    // together prove the same decision `start` makes.
+    fn ds(name: &str) -> DatasetId {
+        DatasetId::from_str(name)
+    }
+
+    #[test]
+    fn partition_isolates_one_dataset_failure_from_the_healthy_ones() {
+        // Middle dataset fails; the two around it must still boot (INV-36 / CN-10).
+        let outcomes = vec![
+            (ds("alpha"), Ok(1u32)),
+            (ds("bravo"), Err(anyhow!("controller init blew up"))),
+            (ds("charlie"), Ok(3u32)),
+        ];
+
+        let (ready, failed) = DataService::partition_boot_outcomes(outcomes);
+
+        assert_eq!(ready, vec![(ds("alpha"), 1u32), (ds("charlie"), 3u32)]);
+        assert_eq!(failed, vec![ds("bravo")]);
+        // Two survivors clear the floor.
+        DataService::enforce_all_fail_floor(3, ready.len()).expect("a partial failure must still boot");
+    }
+
+    #[test]
+    fn all_fail_trips_the_floor() {
+        // Every configured dataset failed: the service must bail rather than come up empty and
+        // masquerade as healthy.
+        let outcomes: Vec<(DatasetId, anyhow::Result<u32>)> =
+            vec![(ds("alpha"), Err(anyhow!("boom"))), (ds("bravo"), Err(anyhow!("boom")))];
+
+        let (ready, failed) = DataService::partition_boot_outcomes(outcomes);
+        assert!(ready.is_empty());
+        assert_eq!(failed, vec![ds("alpha"), ds("bravo")]);
+
+        let err =
+            DataService::enforce_all_fail_floor(2, ready.len()).expect_err("an all-fail boot must refuse to start");
+        assert!(err.to_string().contains("refusing to start"), "{err}");
+    }
+
+    #[test]
+    fn one_survivor_clears_the_floor() {
+        // A single healthy dataset among failures is enough to boot -- the floor is *all*-fail.
+        let outcomes = vec![(ds("alpha"), Err(anyhow!("boom"))), (ds("bravo"), Ok(7u32))];
+
+        let (ready, failed) = DataService::partition_boot_outcomes(outcomes);
+        assert_eq!(ready, vec![(ds("bravo"), 7u32)]);
+        assert_eq!(failed, vec![ds("alpha")]);
+        DataService::enforce_all_fail_floor(2, ready.len()).expect("one survivor must clear the floor");
+    }
+
+    #[test]
+    fn empty_configuration_still_boots() {
+        // No configured datasets: the floor does not fire (it is scoped to `configured > 0`), so an
+        // empty service comes up exactly as it does today.
+        let (ready, failed) = DataService::partition_boot_outcomes::<u32>(vec![]);
+        assert!(ready.is_empty());
+        assert!(failed.is_empty());
+        DataService::enforce_all_fail_floor(0, ready.len()).expect("empty config must boot");
     }
 }
