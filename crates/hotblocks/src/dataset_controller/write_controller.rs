@@ -1042,8 +1042,7 @@ mod tests {
 
         let (head_tx, _head_rx) = watch::channel(None);
         let (fin_tx, _fin_rx) = watch::channel(None);
-        let mut rebuilt =
-            WriteController::new(f.db.clone(), f.dataset_id, DatasetKind::Evm, head_tx, fin_tx)?;
+        let mut rebuilt = WriteController::new(f.db.clone(), f.dataset_id, DatasetKind::Evm, head_tx, fin_tx)?;
         let window_parent = Some("h0".to_string());
 
         // Record the predicate before `retain`: on the buggy constructor the full scan repairs
