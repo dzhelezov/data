@@ -361,18 +361,27 @@ where
             // A committed block advances the shared position (`accept_new_block`), and a
             // linkage-reject strike is scoped to the position it was accrued at — so once the
             // position moves forward, every *other* endpoint's strike is stale. Clear their
-            // counters and cancel any parked backoff; otherwise an endpoint that rejected at the
-            // old position stays asleep at the new one for up to the full 10 s rung, needlessly
-            // delaying it from rejoining a position it may now link (a multi-endpoint failover
-            // regression). The committing endpoint already reset its own counter and must keep its
-            // live stream, so it is skipped.
+            // reject counters and cancel a parked *reject* backoff; otherwise an endpoint that
+            // rejected at the old position stays asleep at the new one for up to the full 10 s rung,
+            // needlessly delaying it from rejoining a position it may now link (a multi-endpoint
+            // failover regression). The committing endpoint already reset its own counter and must
+            // keep its live stream, so it is skipped.
+            //
+            // Only a *reject-attributable* backoff is cancelled: `reject_counter > 0 &&
+            // error_counter == 0`. A backoff installed by `on_error` (transport/parse fault) is
+            // position-independent, and at head — where some endpoint commits nearly every block —
+            // blindly waking every peer in `Backoff` would defeat `on_error`'s exponential backoff
+            // for a transport-faulting endpoint, re-amplifying calls to it (the exact class of bug
+            // this counter fixes, on the other ladder). When both strikes are set the current
+            // backoff's cause is ambiguous, so it is conservatively left parked.
             if matches!(event, Poll::Ready(DataEvent::Block { .. })) {
                 for (j, other) in self.endpoints.iter_mut().enumerate() {
                     if j == committed_idx {
                         continue;
                     }
+                    let reject_attributable = other.reject_counter > 0 && other.error_counter == 0;
                     other.reject_counter = 0;
-                    if matches!(other.state, EndpointState::Backoff(_)) {
+                    if reject_attributable && matches!(other.state, EndpointState::Backoff(_)) {
                         other.state = EndpointState::Ready;
                     }
                 }
@@ -500,7 +509,10 @@ where
 mod tests {
     use std::{
         collections::VecDeque,
-        sync::{Arc, Mutex},
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc, Mutex
+        },
         task::{Context, Poll},
         time::Duration
     };
@@ -553,14 +565,30 @@ mod tests {
     #[derive(Debug)]
     struct ReplayClient {
         source: String,
-        batches: Arc<Mutex<VecDeque<Vec<TestBlock>>>>
+        batches: Arc<Mutex<VecDeque<Vec<TestBlock>>>>,
+        transport_failure: bool,
+        requests: Arc<AtomicUsize>
     }
 
     impl ReplayClient {
         fn new(source: &str, batches: Vec<Vec<TestBlock>>) -> Self {
             Self {
                 source: source.to_string(),
-                batches: Arc::new(Mutex::new(batches.into()))
+                batches: Arc::new(Mutex::new(batches.into())),
+                transport_failure: false,
+                requests: Arc::new(AtomicUsize::new(0))
+            }
+        }
+
+        /// A source whose every stream request fails at the transport layer, so it climbs the
+        /// `on_error` backoff ladder. `requests` counts stream attempts, exposing whether another
+        /// endpoint's commit wrongly woke it from that (position-independent) transport backoff.
+        fn always_failing(source: &str) -> Self {
+            Self {
+                source: source.to_string(),
+                batches: Arc::new(Mutex::new(VecDeque::new())),
+                transport_failure: true,
+                requests: Arc::new(AtomicUsize::new(0))
             }
         }
     }
@@ -572,6 +600,10 @@ mod tests {
             &self,
             _req: BlockStreamRequest
         ) -> futures::future::BoxFuture<'static, anyhow::Result<BlockStreamResponse<TestBlock>>> {
+            self.requests.fetch_add(1, Ordering::SeqCst);
+            if self.transport_failure {
+                return async { Err(anyhow::anyhow!("scripted transport failure")) }.boxed();
+            }
             let mut queue = self.batches.lock().unwrap();
             let batch = if queue.len() > 1 {
                 queue.pop_front().unwrap()
@@ -780,6 +812,106 @@ mod tests {
         assert!(
             matches!(ds.endpoints[1].state, EndpointState::Stream { .. }),
             "the committing endpoint is skipped by the reset and keeps its live stream"
+        );
+    }
+
+    // Regression guard for the cross-endpoint reset in `poll_next_event`. A peer's committed block
+    // must wake another endpoint only when ITS backoff is a now-stale linkage reject — NOT when it
+    // is a transport/parse-fault backoff installed by `on_error`, which is position-independent. At
+    // head some endpoint commits nearly every block, so blindly clearing every peer's `Backoff`
+    // would defeat `on_error`'s exponential backoff and re-amplify calls to a transport-faulting
+    // endpoint. Here endpoint 0 fails every stream (climbs the error ladder to a 100ms backoff after
+    // its free first retry = 2 requests), then endpoint 1 commits blocks 11..=13; with the clock
+    // paused the faulting endpoint must stay parked and issue no further requests. Pre-fix it was
+    // woken on every commit and re-requested each time (5 requests).
+    #[tokio::test(start_paused = true)]
+    async fn committed_blocks_do_not_cancel_another_endpoints_transport_backoff() {
+        let faulting = ReplayClient::always_failing("xep-transport-failure");
+        let faulting_requests = faulting.requests.clone();
+        let healthy = ReplayClient::new(
+            "xep-healthy-stream",
+            vec![vec![
+                TestBlock::new(10, "0xB10", "0xP9"),
+                TestBlock::new(11, "0xB11", "0xB10"),
+                TestBlock::new(12, "0xB12", "0xB11"),
+                TestBlock::new(13, "0xB13", "0xB12"),
+            ]]
+        );
+        let mut ds = StandardDataSource::new(
+            vec![faulting, healthy],
+            Ok as fn(TestBlock) -> anyhow::Result<TestBlock>
+        );
+        ds.set_position(10, Some("0xP9"));
+
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        for expected_number in 10..=13 {
+            match ds.poll_next_event(&mut cx) {
+                Poll::Ready(DataEvent::Block { block, .. }) => assert_eq!(block.number(), expected_number),
+                other => panic!(
+                    "expected healthy block {expected_number}, pending={}",
+                    matches!(other, Poll::Pending)
+                )
+            }
+        }
+
+        assert_eq!(
+            faulting_requests.load(Ordering::SeqCst),
+            2,
+            "the free first retry installs a transport backoff; healthy commits must not re-wake it"
+        );
+        assert_eq!(
+            ds.endpoints[0].error_counter, 2,
+            "the transport error strike survives while parked"
+        );
+        assert!(
+            matches!(ds.endpoints[0].state, EndpointState::Backoff(_)),
+            "the transport backoff stays parked across peer commits"
+        );
+    }
+
+    // Load-bearing for the `&& error_counter == 0` half of the attributability guard. A reject
+    // strike and a transport-error strike can coexist (reject at a position, backoff resolves,
+    // re-request faults) — the currently parked backoff's cause is then ambiguous, so a peer commit
+    // must NOT cancel it. Without the clause, a stale reject strike would license cancelling a live
+    // transport backoff.
+    #[tokio::test(start_paused = true)]
+    async fn a_coexisting_error_strike_keeps_the_backoff_parked_on_a_peer_commit() {
+        let mut ds = StandardDataSource::new(
+            vec![
+                ReplayClient::always_failing("xep-mixed"),
+                ReplayClient::new(
+                    "xep-healthy",
+                    vec![vec![
+                        TestBlock::new(10, "0xB10", "0xP9"),
+                        TestBlock::new(11, "0xB11", "0xB10"),
+                    ]]
+                ),
+            ],
+            Ok as fn(TestBlock) -> anyhow::Result<TestBlock>
+        );
+        ds.set_position(10, Some("0xP9"));
+
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        // First poll parks the faulting endpoint in a transport backoff and commits block 10.
+        let _ = ds.poll_next_event(&mut cx);
+        assert!(
+            matches!(ds.endpoints[0].state, EndpointState::Backoff(_)),
+            "precondition: transport backoff"
+        );
+        assert!(
+            ds.endpoints[0].error_counter > 0,
+            "precondition: an error strike is set"
+        );
+
+        // Inject a coexisting reject strike, then let the healthy endpoint commit block 11.
+        ds.endpoints[0].reject_counter = 1;
+        let _ = ds.poll_next_event(&mut cx);
+
+        assert!(
+            matches!(ds.endpoints[0].state, EndpointState::Backoff(_)),
+            "an ambiguous reject+error backoff must stay parked, not be cancelled by a peer commit"
         );
     }
 
