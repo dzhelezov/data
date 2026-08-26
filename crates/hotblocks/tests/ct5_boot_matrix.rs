@@ -12,6 +12,8 @@
 //! kind makes `create_dataset_if_not_exists` reject the reopen (an existing dataset cannot change
 //! kind), so exactly that controller's init fails while the others initialize and serve.
 
+use std::time::Duration;
+
 use anyhow::{Result, ensure};
 use sqd_hotblocks_harness::{
     chain::{Chain, Evm, Solana},
@@ -86,15 +88,31 @@ async fn ct5_one_datasets_boot_failure_is_isolated_and_alarmed() -> Result<()> {
         "the healthy dataset must keep serving (boot-ready 1) despite its neighbour's failure"
     );
 
-    // The isolation is real end to end, not just a gauge: the healthy dataset answers (an empty
-    // dataset still serves `/head` as 200/null), while the broken one is omitted (404 → `Err`).
+    // The isolation is real end to end, not just a gauge. Assert the HTTP status explicitly — an
+    // `is_err()` on the typed `head()` would also accept a 500 or a transport failure, passing for
+    // the wrong reason. The healthy dataset answers 2xx (an empty dataset still serves `/head` as
+    // 200/null); the broken one is a 404 (`UnknownDataset` — omitted from the service, not served).
+    let http = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(10))
+        .build()?;
+    let healthy_status = http
+        .get(format!("{}/datasets/{HEALTHY}/head", sut.base_url()))
+        .send()
+        .await?
+        .status();
     ensure!(
-        Client::new(sut.base_url(), HEALTHY)?.head().await.is_ok(),
-        "the healthy dataset must serve requests after the isolated failure"
+        healthy_status.is_success(),
+        "the healthy dataset must serve /head (2xx) after the isolated failure, got {healthy_status}"
     );
+    let broken_status = http
+        .get(format!("{}/datasets/{BROKEN}/head", sut.base_url()))
+        .send()
+        .await?
+        .status();
     ensure!(
-        Client::new(sut.base_url(), BROKEN)?.head().await.is_err(),
-        "the broken dataset must be omitted from the service, not served"
+        broken_status == reqwest::StatusCode::NOT_FOUND,
+        "the broken dataset must be omitted — /head must be 404 (UnknownDataset), not served, got {broken_status}"
     );
 
     Ok(())
