@@ -75,7 +75,10 @@ impl WriteController {
             dataset_id,
             dataset_kind,
             first_block: first_chunk.as_ref().map_or(0, |c| c.first_block()),
-            parent_block_hash: first_chunk.as_ref().map(|c| c.last_block_hash().to_string()),
+            // Anchor is the parent hash of the window's FIRST block. Mirror the rollback path,
+            // which already rederives it from `first_chunk.parent_block_hash()`; `last_block_hash()`
+            // (the last block IN the chunk) is a different block and breaks the `starts_at` no-op.
+            parent_block_hash: first_chunk.as_ref().map(|c| c.parent_block_hash().to_string()),
             first_chunk_head: first_chunk.as_ref().map(get_chunk_head),
             head: last_chunk.as_ref().map(get_chunk_head),
             finalized_head: label.and_then(|l| l.finalized_head().cloned()),
@@ -1028,6 +1031,32 @@ mod tests {
 
         assert_eq!(*head_rx.borrow(), Some(block(10, "h-10")));
         assert_eq!(*fin_rx.borrow(), Some(block(5, "h-5")));
+    }
+
+    #[test]
+    fn rebuilt_writer_rederives_window_parent_anchor() -> anyhow::Result<()> {
+        let mut f = fixture();
+        let only_chunk = chunk(1, 10, "h10", "h0");
+        f.wc.new_chunk(None, &only_chunk)?;
+        drop(f.wc);
+
+        let (head_tx, _head_rx) = watch::channel(None);
+        let (fin_tx, _fin_rx) = watch::channel(None);
+        let mut rebuilt = WriteController::new(f.db.clone(), f.dataset_id, DatasetKind::Evm, head_tx, fin_tx)?;
+        let window_parent = Some("h0".to_string());
+
+        // Record the predicate before `retain`: on the buggy constructor the full scan repairs
+        // the in-memory anchor, so asserting only the return value or the final state is vacuous.
+        let no_op_fast_path_was_armed = rebuilt.starts_at(1, &window_parent);
+        assert!(rebuilt.retain(1, window_parent.clone())?);
+
+        assert!(
+            no_op_fast_path_was_armed,
+            "a rebuilt writer must recognize retain(window_start, window_parent) as a no-op"
+        );
+        assert!(rebuilt.starts_at(1, &window_parent));
+        assert_eq!(f.db.snapshot().get_first_chunk(f.dataset_id)?, Some(only_chunk));
+        Ok(())
     }
 
     // Head-only progress must not fire the finalized channel — no spurious
