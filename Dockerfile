@@ -1,5 +1,7 @@
 # syntax=docker/dockerfile:1
-FROM rust:1.89-bookworm AS rust
+# rust:1.89-bookworm — pinned to the multi-arch OCI image index digest for reproducible builds
+# (amd64+arm64 buildx targets preserved; the tag is kept inline before the digest as the readable version).
+FROM rust:1.89-bookworm@sha256:948f9b08a66e7fe01b03a98ef1c7568292e07ec2e4fe90d88c07bb14563c84ff AS rust
 
 
 FROM rust AS builder
@@ -75,7 +77,8 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     && cp "$(ls -t target/release/deps/flush_spill-* | grep -v '\.d$' | head -1)" /out/flush_spill
 
 
-FROM debian:bookworm-slim AS flush-bench
+# debian:bookworm-slim — pinned to the multi-arch OCI image index digest (see the rust base above).
+FROM debian:bookworm-slim@sha256:88200866dfff7ea7f5cbcb6ec7c8a701889efe6fe859fe64d6990e4b07ea4171 AS flush-bench
 WORKDIR /app
 COPY --from=flush-bench-builder /out/flush_spill .
 ENTRYPOINT ["/app/flush_spill"]
@@ -92,7 +95,8 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
 
 
 # keep this stage last: it is the default target of a bare `docker build .`
-FROM debian:bookworm-slim AS sqd-archive
+# debian:bookworm-slim — pinned to the multi-arch OCI image index digest (see the rust base above).
+FROM debian:bookworm-slim@sha256:88200866dfff7ea7f5cbcb6ec7c8a701889efe6fe859fe64d6990e4b07ea4171 AS sqd-archive
 RUN apt-get update && apt-get install ca-certificates -y
 WORKDIR /app
 COPY --from=archive-builder /out/sqd-archive .
